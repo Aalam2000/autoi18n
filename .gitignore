@@ -1,0 +1,19 @@
+# venv / IDE
+.venv/
+.idea/
+.vscode/
+__pycache__/
+*.pyc
+
+# сборки
+dist/
+build/
+*.egg-info/
+
+# локальные данные
+.env
+translations/
+*.log
+
+# dev-папка
+_autoi18n_dev/
