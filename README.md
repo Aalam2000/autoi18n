@@ -2,6 +2,8 @@
 
 Lightweight post-render HTML translation for Python projects.
 
+auto-i18n-lib translates already-rendered HTML into the user's language with minimal integration effort.
+It is designed for projects where you want multilingual UI without rebuilding templates, database models, or business logic.
 ---
 
 ## Why this library
