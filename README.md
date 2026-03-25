@@ -1,130 +1,402 @@
-# autoi18n
+# auto-i18n-lib
 
-Runtime HTML i18n with OpenAI: translate the page on first request, cache results to JSON, reuse on subsequent requests, and auto-sync when the source changes.
+Lightweight HTML translation library for Python projects.
 
-**PyPI name:** `autoi18n` | **Import:** `autoi18n`
+`auto-i18n-lib` translates already-rendered HTML into the user’s language with minimal integration effort.
+It is designed for projects where you want multilingual UI without rewriting templates, models, or business logic.
+
+The library works at the rendered HTML level:
+
+* keeps existing project structure intact;
+* translates visible text, table content, form-related UI text, and useful attributes;
+* caches translations locally by target language;
+* can be integrated into existing render flows with minimal changes.
+
+---
+
+## Key idea
+
+You do **not** need to rebuild the project around a full i18n framework.
+
+Instead, you:
+
+1. render HTML as usual;
+2. pass the resulting HTML through the translator;
+3. return translated HTML to the user.
+
+This makes the library especially useful for:
+
+* legacy systems;
+* custom admin panels;
+* internal tools;
+* SaaS products with fast evolving UI;
+* projects where database structure should remain untouched.
 
 ---
 
 ## Features
 
-- 🔁 On-the-fly translation of raw HTML strings  
-- 🗂️ JSON cache per target language (on disk)  
-- 🔄 Auto-sync: stale entries removed when source changes  
-- 🧩 Chunking for model context limits (long pages split safely)  
-- 🛡️ Preserves `<script>`/`<style>` as-is  
-- 🎛️ Concise UI translation (e.g., buttons)  
-- 🌐 Helpers: detect browser lang, pick alternate lang
+* HTML translation after render
+* Translation of:
+
+  * regular text nodes
+  * table content
+  * button labels
+  * `option`
+  * `textarea`
+  * useful attributes:
+
+    * `placeholder`
+    * `title`
+    * `alt`
+    * `aria-label`
+    * `value` for button-like inputs
+* Per-language JSON cache
+* Batch translation of new strings
+* Reuse of previously saved translations
+* Minimal integration into existing projects
+* Backward-aware cache loading for older cache files
 
 ---
 
 ## Installation
 
 ```bash
-    pip install autoi18n
+pip install auto-i18n-lib
 ```
-## Quick start
-``` 
-from dynamic_i18n import Translator
 
-html_in = "<h1>Добро пожаловать</h1><p>Это тест.</p>"
-tr = Translator(
+---
+
+## Requirements
+
+* Python 3.8+
+* OpenAI API key
+
+---
+
+## Quick start
+
+```python
+from autoi18n import Translator
+
+translator = Translator(
+    api_key="YOUR_OPENAI_API_KEY",
+    cache_dir="./translations",
     source_lang="ru",
-    cache_dir="./translations",   # JSON cache folder
-    # api_key="sk-..."            # or use OPENAI_API_KEY env var
 )
 
-html_out = tr.translate_html(html_in, target_lang="en", page_name="page")
-print(html_out)
-First call translates via OpenAI and writes ./translations/page.en.json.
-Next calls reuse the cache and only translate new/changed strings.
-```
-## Environment
-``` 
-OPENAI_API_KEY — used if api_key not passed to Translator.
-```
-## API
+html = """
+<h1>Добро пожаловать</h1>
+<p>Это тестовая страница</p>
+<button>Сохранить</button>
+"""
 
-``` 
-Translator(source_lang="ru", cache_dir="./translations", api_key=None)
-translate_html(html: str, target_lang: str, page_name: str = "page") -> str
-```
+translated_html = translator.translate_html(
+    html=html,
+    target_lang="en",
+    page_name="home",
+)
 
-## Translates visible text nodes, preserves script/style, chunks long text, updates cache JSON.
-
-```
-translate_text(text: str, target_lang: str, page_name: str = "page") -> str
+print(translated_html)
 ```
 
-## Low-level single-string translation with caching.
+---
 
+## Basic usage
+
+### Translate plain text
+
+```python
+from autoi18n import Translator
+
+translator = Translator(
+    api_key="YOUR_OPENAI_API_KEY",
+    cache_dir="./translations",
+    source_lang="ru",
+)
+
+result = translator.translate_text(
+    text="Привет, мир!",
+    target_lang="en",
+    page_name="common",
+)
+
+print(result)
 ```
 
-detect_browser_lang(accept_language_header: str) -> str
+### Translate HTML
+
+```python
+from autoi18n import Translator
+
+translator = Translator(
+    api_key="YOUR_OPENAI_API_KEY",
+    cache_dir="./translations",
+    source_lang="ru",
+)
+
+html = """
+<form>
+    <label>Имя</label>
+    <input type="text" placeholder="Введите имя">
+    <textarea placeholder="Введите комментарий"></textarea>
+    <input type="submit" value="Отправить">
+</form>
+"""
+
+translated_html = translator.translate_html(
+    html=html,
+    target_lang="en",
+    page_name="form_page",
+)
+
+print(translated_html)
 ```
 
-## Parses Accept-Language → short code like ru, en, fr.
+---
 
-```
-get_alternative_lang(current: str, browser_lang: str) -> str
-```
+## Tables and forms
 
-## Returns alternate code for a language toggle.
-Cache layout
+The library now supports translation of common UI structures such as tables and forms.
 
-translations/
-└─ page.en.json   # UTF-8 JSON: { "source": "translated", ... }
 Example:
 
-``` json (example)
-{
-  "Добро пожаловать": "Welcome",
-  "Выберите язык:": "Choose a language:"
-}
+```python
+html = """
+<table>
+    <tr>
+        <th>Клиент</th>
+        <th>Статус</th>
+    </tr>
+    <tr>
+        <td>Иван Петров</td>
+        <td>Ожидает</td>
+    </tr>
+</table>
+
+<select>
+    <option>Выберите страну</option>
+    <option>Азербайджан</option>
+</select>
+"""
 ```
-## Minimal FastAPI wiring (example) python
-```
+
+All visible text inside these elements is processed through the same HTML translation flow.
+
+---
+
+## FastAPI example
+
+```python
 from fastapi import FastAPI, Request
-from dynamic_i18n import Translator
-from pathlib import Path
+from fastapi.responses import HTMLResponse
+from autoi18n import Translator
 
 app = FastAPI()
-tr = Translator(source_lang="ru", cache_dir="./translations")
-HTML_PATH = Path("index.html")
 
-@app.get("/")
-def home():
-    return HTML_PATH.read_text(encoding="utf-8")
+translator = Translator(
+    api_key="YOUR_OPENAI_API_KEY",
+    cache_dir="./translations",
+    source_lang="ru",
+)
 
-@app.get("/detect_lang")
-def detect_lang(request: Request):
-    return {"lang": tr.detect_browser_lang(request.headers.get("accept-language", ""))}
+@app.get("/", response_class=HTMLResponse)
+async def index(request: Request):
+    html = """
+    <h1>Главная страница</h1>
+    <p>Добро пожаловать в систему</p>
+    <button>Продолжить</button>
+    """
 
-@app.get("/alt_lang")
-def alt_lang(request: Request, current: str = "ru"):
-    browser = tr.detect_browser_lang(request.headers.get("accept-language", ""))
-    return {"lang": tr.get_alternative_lang(current, browser)}
+    accept_language = request.headers.get("accept-language", "")
+    target_lang = translator.detect_browser_lang(accept_language)
 
-@app.get("/translate")
-def translate(lang: str = "en"):
-    html = HTML_PATH.read_text(encoding="utf-8")
-    return tr.translate_html(html, target_lang=lang, page_name="page")
+    translated_html = translator.translate_html(
+        html=html,
+        target_lang=target_lang,
+        page_name="index",
+    )
+    return translated_html
 ```
-# Notes & limits
-You control OpenAI usage/billing.
 
-Chunking keeps requests within model limits; HTML structure preserved.
+---
 
-Short labels (buttons) use a concise prompt to avoid verbose text.
+## Flask example
 
-This package is for runtime translation with caching; static catalogs are out of scope.
+```python
+from flask import Flask, request
+from autoi18n import Translator
 
-# Versioning
-Semantic Versioning: MAJOR.MINOR.PATCH.
+app = Flask(__name__)
 
-# License
-MIT © BONA
+translator = Translator(
+    api_key="YOUR_OPENAI_API_KEY",
+    cache_dir="./translations",
+    source_lang="ru",
+)
 
-# Support
-Issues & feature requests → GitHub Issues (see project URLs in metadata).
+@app.route("/")
+def index():
+    html = """
+    <h1>Панель управления</h1>
+    <p>Здесь отображается основная информация</p>
+    """
 
+    accept_language = request.headers.get("Accept-Language", "")
+    target_lang = translator.detect_browser_lang(accept_language)
+
+    return translator.translate_html(
+        html=html,
+        target_lang=target_lang,
+        page_name="dashboard",
+    )
+```
+
+---
+
+## Cache behavior
+
+Translations are stored in JSON files inside the cache directory.
+
+Current cache format:
+
+* one file per target language:
+
+  * `translations/en.json`
+  * `translations/de.json`
+  * `translations/az.json`
+
+This allows reuse of the same translated strings across different pages.
+
+### Legacy cache compatibility
+
+Older versions could store cache in page-based files such as:
+
+* `home.en.json`
+* `profile.de.json`
+
+The new version can read legacy page-based cache files and merge their data into the new language-level cache automatically.
+
+---
+
+## Constructor
+
+```python
+Translator(
+    cache_dir="./translations",
+    api_key=None,
+    source_lang=None,
+    model="gpt-4o-mini",
+)
+```
+
+### Parameters
+
+* `cache_dir` — directory for translation cache files
+* `api_key` — OpenAI API key
+* `source_lang` — source language of your project content
+* `model` — OpenAI model name used for translation
+
+If `source_lang` is not provided, the library tries to read it from the `SOURCE_LANG` environment variable.
+If that variable is also missing, the default source language is `ru`.
+
+---
+
+## Public methods
+
+### `translate_text(text, target_lang, page_name="page", prompt_type="normal")`
+
+Translates a single text string.
+
+### `translate_html(html, target_lang, page_name="page")`
+
+Translates rendered HTML while preserving the HTML structure.
+
+### `detect_browser_lang(accept_language)`
+
+Extracts the primary browser language from the `Accept-Language` header.
+
+### `get_alternative_lang(current_lang, browser_lang)`
+
+Returns an alternative language value for language switch logic.
+
+---
+
+## Recommended content rule
+
+For better translation quality and more stable terminology, it is recommended to store structured business data in English where practical.
+
+Typical recommendation:
+
+* UI labels may stay in the project’s main source language;
+* structured reference values and reusable business terms are best kept normalized and consistent;
+* English is often the most convenient base language for long-term multilingual scaling.
+
+---
+
+## Upgrade notes
+
+### What changed in the new version
+
+* translation coverage was expanded;
+* table content is now translated;
+* form-related UI text is now translated;
+* attribute translation support was extended;
+* new strings are translated in batches;
+* cache storage moved to per-language files instead of page-only cache files;
+* old cache entries are no longer automatically removed during page rendering.
+
+### Why this changed
+
+The new behavior improves:
+
+* translation completeness;
+* cache stability;
+* reuse of translations across pages;
+* performance for repeated UI elements.
+
+### Migration impact
+
+In most projects, integration code can remain unchanged.
+
+Potential differences after upgrade:
+
+* cache files may now be created as `translations/<lang>.json`;
+* projects relying on old page-specific cache layout should review deployment or backup rules;
+* if you had custom scripts around cache maintenance, update them to the new per-language structure.
+
+---
+
+## Practical integration model
+
+Typical flow in a project:
+
+```python
+html = render_template(...)
+translated_html = translator.translate_html(
+    html,
+    target_lang=user_lang,
+    page_name="some_page",
+)
+return translated_html
+```
+
+This keeps:
+
+* templates unchanged;
+* business logic unchanged;
+* database schema unchanged.
+
+---
+
+## Notes
+
+* The library is intended for pragmatic multilingual delivery, not for replacing every possible i18n workflow.
+* Translation quality depends on the source text quality.
+* Repeated, consistent source wording produces the best cache reuse and the most stable translations.
+
+---
+
+## License
+
+MIT

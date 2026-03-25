@@ -9,6 +9,7 @@ __pycache__/
 dist/
 build/
 *.egg-info/
+tmp/
 
 # локальные данные
 .env
@@ -17,3 +18,4 @@ translations/
 
 # dev-папка
 _autoi18n_dev/
+publish.ps1
