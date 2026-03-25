@@ -1,61 +1,56 @@
 # auto-i18n-lib
 
-Lightweight HTML translation library for Python projects.
-
-`auto-i18n-lib` translates already-rendered HTML into the user’s language with minimal integration effort.
-It is designed for projects where you want multilingual UI without rewriting templates, models, or business logic.
-
-The library works at the rendered HTML level:
-
-* keeps existing project structure intact;
-* translates visible text, table content, form-related UI text, and useful attributes;
-* caches translations locally by target language;
-* can be integrated into existing render flows with minimal changes.
+Lightweight post-render HTML translation for Python projects.
 
 ---
 
-## Key idea
+## Why this library
 
-You do **not** need to rebuild the project around a full i18n framework.
+Most i18n solutions require you to:
 
-Instead, you:
+- mark strings in templates;
+- restructure project code;
+- maintain translation catalogs;
+- adapt data storage rules.
+
+This library uses a different approach:
 
 1. render HTML as usual;
-2. pass the resulting HTML through the translator;
+2. pass the final HTML through the translator;
 3. return translated HTML to the user.
 
-This makes the library especially useful for:
+That makes it practical for:
 
-* legacy systems;
-* custom admin panels;
-* internal tools;
-* SaaS products with fast evolving UI;
-* projects where database structure should remain untouched.
+- existing projects;
+- legacy systems;
+- admin panels;
+- internal tools;
+- rapidly changing SaaS interfaces.
 
 ---
 
 ## Features
 
-* HTML translation after render
-* Translation of:
+- Post-render HTML translation
+- Translation of:
+  - text nodes
+  - table content
+  - button labels
+  - `option`
+  - `textarea`
+  - selected attributes:
+    - `placeholder`
+    - `title`
+    - `alt`
+    - `aria-label`
+    - `value` for button-like inputs
+- Per-language JSON cache
+- Batch translation of new strings
+- Reuse of cached translations across pages
+- Backward-aware loading of legacy page-based cache files
+- Minimal project integration
 
-  * regular text nodes
-  * table content
-  * button labels
-  * `option`
-  * `textarea`
-  * useful attributes:
-
-    * `placeholder`
-    * `title`
-    * `alt`
-    * `aria-label`
-    * `value` for button-like inputs
-* Per-language JSON cache
-* Batch translation of new strings
-* Reuse of previously saved translations
-* Minimal integration into existing projects
-* Backward-aware cache loading for older cache files
+The current implementation is based on `HTMLParser`, the `Translator` class, local JSON cache saving, browser language detection, and OpenAI-based translation. :contentReference[oaicite:2]{index=2}
 
 ---
 
@@ -63,14 +58,43 @@ This makes the library especially useful for:
 
 ```bash
 pip install auto-i18n-lib
-```
+
 
 ---
 
 ## Requirements
 
-* Python 3.8+
+* Python 3.9+
 * OpenAI API key
+
+The package metadata currently requires Python `>=3.9`.  
+
+---
+
+## Environment variables
+
+You can configure the translator through constructor arguments or environment variables.
+
+### Supported environment variables
+
+* `OPENAI_API_KEY` — your OpenAI API key
+* `SOURCE_LANG` — source language of your project content
+
+Example:
+
+```bash
+export OPENAI_API_KEY="your_key"
+export SOURCE_LANG="ru"
+```
+
+Or on Windows PowerShell:
+
+```powershell
+$env:OPENAI_API_KEY="your_key"
+$env:SOURCE_LANG="ru"
+```
+
+Note: `source_lang` is read from `SOURCE_LANG` if not provided explicitly in the constructor. This behavior is implemented in the current `Translator` class. 
 
 ---
 
@@ -155,36 +179,6 @@ print(translated_html)
 
 ---
 
-## Tables and forms
-
-The library now supports translation of common UI structures such as tables and forms.
-
-Example:
-
-```python
-html = """
-<table>
-    <tr>
-        <th>Клиент</th>
-        <th>Статус</th>
-    </tr>
-    <tr>
-        <td>Иван Петров</td>
-        <td>Ожидает</td>
-    </tr>
-</table>
-
-<select>
-    <option>Выберите страну</option>
-    <option>Азербайджан</option>
-</select>
-"""
-```
-
-All visible text inside these elements is processed through the same HTML translation flow.
-
----
-
 ## FastAPI example
 
 ```python
@@ -254,19 +248,78 @@ def index():
 
 ---
 
+## Typical integration pattern
+
+```python
+html = render_template(...)
+translated_html = translator.translate_html(
+    html=html,
+    target_lang=user_lang,
+    page_name="some_page",
+)
+return translated_html
+```
+
+This keeps:
+
+* templates unchanged;
+* business logic unchanged;
+* database schema unchanged.
+
+---
+
+## What is translated
+
+The current implementation processes:
+
+* regular visible text nodes;
+* table text;
+* form-related visible text;
+* selected UI attributes;
+* button-like input values.
+
+These behaviors are implemented in the current parser and translator logic. 
+
+---
+
+## What is not translated
+
+The current implementation intentionally skips:
+
+* `script`
+* `style`
+* `noscript`
+* elements with:
+
+  * `translate="no"`
+  * `data-translate="no"`
+  * `id="langSwitch"`
+
+It also skips values that look like:
+
+* empty or whitespace-only content;
+* pure numbers;
+* number-like strings;
+* UUID/hash-like strings;
+* many technical Latin-only identifiers, paths, and codes.
+
+These skip rules are explicitly present in the current code. 
+
+---
+
 ## Cache behavior
 
-Translations are stored in JSON files inside the cache directory.
+Translations are stored as JSON files in the cache directory.
 
-Current cache format:
+### Current cache format
 
-* one file per target language:
+One file per target language, for example:
 
-  * `translations/en.json`
-  * `translations/de.json`
-  * `translations/az.json`
+* `translations/en.json`
+* `translations/de.json`
+* `translations/az.json`
 
-This allows reuse of the same translated strings across different pages.
+This allows the same translated strings to be reused across different pages.
 
 ### Legacy cache compatibility
 
@@ -275,7 +328,7 @@ Older versions could store cache in page-based files such as:
 * `home.en.json`
 * `profile.de.json`
 
-The new version can read legacy page-based cache files and merge their data into the new language-level cache automatically.
+The current version can read legacy page-based cache files and merge them into the new language-level cache automatically. This behavior is implemented by `_legacy_file_path()`, `_file_path()`, and `_load_storage()`. 
 
 ---
 
@@ -294,15 +347,14 @@ Translator(
 
 * `cache_dir` — directory for translation cache files
 * `api_key` — OpenAI API key
-* `source_lang` — source language of your project content
-* `model` — OpenAI model name used for translation
+* `source_lang` — source language of the original project content
+* `model` — OpenAI model used for translation
 
-If `source_lang` is not provided, the library tries to read it from the `SOURCE_LANG` environment variable.
-If that variable is also missing, the default source language is `ru`.
+The current default model is `gpt-4o-mini`. 
 
 ---
 
-## Public methods
+## Public API
 
 ### `translate_text(text, target_lang, page_name="page", prompt_type="normal")`
 
@@ -310,7 +362,7 @@ Translates a single text string.
 
 ### `translate_html(html, target_lang, page_name="page")`
 
-Translates rendered HTML while preserving the HTML structure.
+Translates rendered HTML while preserving HTML structure.
 
 ### `detect_browser_lang(accept_language)`
 
@@ -320,17 +372,7 @@ Extracts the primary browser language from the `Accept-Language` header.
 
 Returns an alternative language value for language switch logic.
 
----
-
-## Recommended content rule
-
-For better translation quality and more stable terminology, it is recommended to store structured business data in English where practical.
-
-Typical recommendation:
-
-* UI labels may stay in the project’s main source language;
-* structured reference values and reusable business terms are best kept normalized and consistent;
-* English is often the most convenient base language for long-term multilingual scaling.
+These public methods exist in the current `Translator` class. 
 
 ---
 
@@ -339,12 +381,12 @@ Typical recommendation:
 ### What changed in the new version
 
 * translation coverage was expanded;
-* table content is now translated;
-* form-related UI text is now translated;
-* attribute translation support was extended;
+* table content is translated;
+* form-related UI text is translated;
+* useful attributes are translated;
 * new strings are translated in batches;
-* cache storage moved to per-language files instead of page-only cache files;
-* old cache entries are no longer automatically removed during page rendering.
+* cache storage is language-based;
+* old cache entries are no longer deleted during page rendering.
 
 ### Why this changed
 
@@ -352,51 +394,41 @@ The new behavior improves:
 
 * translation completeness;
 * cache stability;
-* reuse of translations across pages;
-* performance for repeated UI elements.
+* reuse across pages;
+* overall translation efficiency.
 
 ### Migration impact
 
-In most projects, integration code can remain unchanged.
+In many projects, integration code can remain unchanged.
 
-Potential differences after upgrade:
+Possible differences after upgrade:
 
 * cache files may now be created as `translations/<lang>.json`;
-* projects relying on old page-specific cache layout should review deployment or backup rules;
-* if you had custom scripts around cache maintenance, update them to the new per-language structure.
+* old page-specific cache layout may no longer be the only active cache format;
+* custom scripts that depend on page-based cache naming may need adjustment.
 
 ---
 
-## Practical integration model
+## Recommended content rule
 
-Typical flow in a project:
+For better translation quality and more stable terminology, it is recommended to keep structured business data normalized and consistent.
 
-```python
-html = render_template(...)
-translated_html = translator.translate_html(
-    html,
-    target_lang=user_lang,
-    page_name="some_page",
-)
-return translated_html
-```
-
-This keeps:
-
-* templates unchanged;
-* business logic unchanged;
-* database schema unchanged.
+In many projects, English is the most convenient base language for structured reference values and reusable business terms.
 
 ---
 
-## Notes
+## Limitations
 
-* The library is intended for pragmatic multilingual delivery, not for replacing every possible i18n workflow.
-* Translation quality depends on the source text quality.
-* Repeated, consistent source wording produces the best cache reuse and the most stable translations.
+* The library translates rendered HTML, not source templates.
+* Translation quality depends on source text quality.
+* Highly dynamic or fragmented HTML may reduce cache efficiency.
+* This library is intended as a pragmatic i18n layer, not a full replacement for every localization workflow.
 
 ---
 
 ## License
 
 MIT
+
+See the `LICENSE` file included in the package structure. 
+
