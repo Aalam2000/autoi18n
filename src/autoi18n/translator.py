@@ -1,10 +1,12 @@
-# src/autoi18n/translator.py
 import json
 import os
 import re
+import tempfile
+import threading
+import time
 from html import escape
 from html.parser import HTMLParser
-from typing import Callable, Dict, List, Optional, Tuple
+from typing import Callable, Dict, Iterable, List, Optional, Tuple
 
 from openai import OpenAI
 
@@ -18,6 +20,8 @@ NUMBER_LIKE_RE = re.compile(r"^[\d\s\.,:/\-]+$")
 HEX_LIKE_RE = re.compile(r"^[A-Fa-f0-9\-]{8,}$")
 PURE_LATIN_TECH_RE = re.compile(r"^[A-Za-z0-9_\-\s\.:/@#%+=]+$")
 
+PENDING_FILENAME = "_pending.json"
+
 
 def _split_preserve_whitespace(text: str) -> Tuple[str, str, str]:
     match = re.match(r"^(\s*)(.*?)(\s*)$", text, flags=re.DOTALL)
@@ -27,10 +31,6 @@ def _split_preserve_whitespace(text: str) -> Tuple[str, str, str]:
 
 
 def should_translate(text: str, tag: Optional[str] = None, attr_name: Optional[str] = None) -> bool:
-    """
-    Определяем, нужно ли переводить значение.
-    Не режем таблицы/формы — наоборот, теперь они поддерживаются.
-    """
     if text is None:
         return False
 
@@ -43,21 +43,16 @@ def should_translate(text: str, tag: Optional[str] = None, attr_name: Optional[s
     if WHITESPACE_ONLY_RE.fullmatch(raw):
         return False
 
-    # Числа и почти-числа
     if text.isdigit():
         return False
     if NUMBER_LIKE_RE.fullmatch(text):
         return False
 
-    # UUID / hash-like
     if HEX_LIKE_RE.fullmatch(text):
         return False
 
-    # Тех. строки на латинице: коды, логины, пути, идентификаторы
     if PURE_LATIN_TECH_RE.fullmatch(text):
-        # Но некоторые атрибуты UI на латинице надо переводить
         if attr_name in TRANSLATABLE_ATTRS or attr_name == "value":
-            # переводим только если там есть хотя бы одна буква и это похоже на UI-текст
             words = text.split()
             if len(words) >= 2:
                 return True
@@ -66,7 +61,7 @@ def should_translate(text: str, tag: Optional[str] = None, attr_name: Optional[s
     return True
 
 
-def _safe_json_load(path: str) -> Dict[str, str]:
+def _safe_json_load(path: str):
     if not os.path.exists(path):
         return {}
     try:
@@ -77,10 +72,23 @@ def _safe_json_load(path: str) -> Dict[str, str]:
         return {}
 
 
-def _safe_json_save(path: str, data: Dict[str, str]) -> None:
-    os.makedirs(os.path.dirname(path), exist_ok=True)
-    with open(path, "w", encoding="utf-8") as f:
-        json.dump(data, f, ensure_ascii=False, indent=2, sort_keys=True)
+def _safe_json_save(path: str, data) -> None:
+    directory = os.path.dirname(path) or "."
+    os.makedirs(directory, exist_ok=True)
+
+    fd, tmp_path = tempfile.mkstemp(prefix=".tmp_autoi18n_", suffix=".json", dir=directory)
+    try:
+        with os.fdopen(fd, "w", encoding="utf-8") as f:
+            json.dump(data, f, ensure_ascii=False, indent=2, sort_keys=True)
+            f.flush()
+            os.fsync(f.fileno())
+        os.replace(tmp_path, path)
+    finally:
+        if os.path.exists(tmp_path):
+            try:
+                os.remove(tmp_path)
+            except OSError:
+                pass
 
 
 def _extract_json(text: str):
@@ -88,13 +96,11 @@ def _extract_json(text: str):
     if not text:
         raise ValueError("Empty model response")
 
-    # сначала пробуем как есть
     try:
         return json.loads(text)
     except Exception:
         pass
 
-    # потом ищем первый JSON-блок
     start_obj = text.find("{")
     end_obj = text.rfind("}")
     if start_obj != -1 and end_obj != -1 and end_obj > start_obj:
@@ -114,18 +120,12 @@ def _extract_json(text: str):
 
 
 class SimpleHTMLTranslator(HTMLParser):
-    """
-    HTML parser:
-    - сохраняет структуру HTML;
-    - собирает переводимые тексты и атрибуты;
-    - затем подставляет переводы без ломания верстки.
-    """
-
     def __init__(self, translate_callback: Callable[[str, Optional[str], Optional[str]], str]):
         super().__init__(convert_charrefs=False)
         self.result: List[str] = []
         self.translate_callback = translate_callback
         self.tag_stack: List[str] = []
+        self.skip_stack: List[bool] = []
         self.skip_depth = 0
 
     @property
@@ -180,26 +180,21 @@ class SimpleHTMLTranslator(HTMLParser):
         skip_this_tag = self._should_skip_tag(tag, attrs)
         self.result.append(self._render_starttag(tag, attrs, closing=">"))
         self.tag_stack.append(tag)
+        self.skip_stack.append(skip_this_tag)
         if skip_this_tag:
             self.skip_depth += 1
 
     def handle_startendtag(self, tag, attrs):
-        # self-closing tag
         self.result.append(self._render_starttag(tag, attrs, closing=" />"))
 
     def handle_endtag(self, tag):
         self.result.append(f"</{tag}>")
         if self.tag_stack:
-            popped = self.tag_stack.pop()
-            if popped == tag and self.skip_depth > 0:
-                # если закрываем skip-tag, выходим из режима skip
-                # это корректно, т.к. skip включается только на starttag
-                attrs_skip_tags = SKIP_TAGS.union(set())
-                if tag in attrs_skip_tags or tag in {"button", "div", "span", "a", "section", "p", "label"}:
-                    # уменьшаем только если реально были в skip
-                    self.skip_depth -= 1
-                    if self.skip_depth < 0:
-                        self.skip_depth = 0
+            self.tag_stack.pop()
+        if self.skip_stack:
+            skip_this_tag = self.skip_stack.pop()
+            if skip_this_tag and self.skip_depth > 0:
+                self.skip_depth -= 1
 
     def handle_data(self, data):
         if self.skip_depth > 0:
@@ -241,16 +236,6 @@ class SimpleHTMLTranslator(HTMLParser):
 
 
 class Translator:
-    """
-    Основной класс переводчика.
-
-    Совместимость:
-    - старый вызов Translator(cache_dir="./translations", api_key=...)
-      продолжает работать;
-    - поддержан source_lang как в README;
-    - старые page.lang.json автоматически подхватываются и вливаются в новый кэш lang.json.
-    """
-
     def __init__(
         self,
         cache_dir: str = "./translations",
@@ -267,20 +252,50 @@ class Translator:
         self._current_page_name: Optional[str] = None
         self._current_file: Optional[str] = None
         self._cache: Dict[str, str] = {}
+        self._lock = threading.RLock()
 
     def _legacy_file_path(self, page_name: str, lang: str) -> str:
-        filename = f"{page_name}.{lang}.json"
-        return os.path.join(self.cache_dir, filename)
+        return os.path.join(self.cache_dir, f"{page_name}.{lang}.json")
 
     def _file_path(self, lang: str) -> str:
-        filename = f"{lang}.json"
-        return os.path.join(self.cache_dir, filename)
+        return os.path.join(self.cache_dir, f"{lang}.json")
+
+    def _pending_file_path(self) -> str:
+        return os.path.join(self.cache_dir, PENDING_FILENAME)
+
+    def _load_pending(self) -> Dict[str, Dict[str, Dict[str, str]]]:
+        data = _safe_json_load(self._pending_file_path())
+        result: Dict[str, Dict[str, Dict[str, str]]] = {}
+
+        for lang, items in data.items():
+            if not isinstance(lang, str) or not isinstance(items, dict):
+                continue
+
+            lang_bucket: Dict[str, Dict[str, str]] = {}
+            for text, meta in items.items():
+                if not isinstance(text, str):
+                    continue
+
+                if isinstance(meta, dict):
+                    prompt_type = str(meta.get("prompt_type") or "normal")
+                else:
+                    prompt_type = "normal"
+
+                lang_bucket[text] = {"prompt_type": prompt_type}
+
+            if lang_bucket:
+                result[lang] = lang_bucket
+
+        return result
+
+    def _save_pending(self, data: Dict[str, Dict[str, Dict[str, str]]]) -> None:
+        cleaned = {lang: items for lang, items in data.items() if items}
+        _safe_json_save(self._pending_file_path(), cleaned)
 
     def _load_storage(self, page_name: str, lang: str) -> None:
         target_path = self._file_path(lang)
         cache = _safe_json_load(target_path)
 
-        # legacy migration: page.lang.json -> lang.json
         legacy_path = self._legacy_file_path(page_name, lang)
         legacy_cache = _safe_json_load(legacy_path)
 
@@ -332,10 +347,6 @@ class Translator:
         return translated or text
 
     def _translate_batch(self, items: List[Tuple[str, str]], target_lang: str) -> Dict[str, str]:
-        """
-        items: [(text, prompt_type), ...]
-        Возвращает dict[source_text] = translated_text
-        """
         if not items:
             return {}
 
@@ -376,6 +387,160 @@ class Translator:
 
         return result
 
+    def _resolve_prompt_type(self, tag: Optional[str], attr_name: Optional[str]) -> str:
+        if tag == "button" or attr_name == "value":
+            return "button"
+        if attr_name is not None:
+            return "attr"
+        return "normal"
+
+    def enqueue_missing_texts(
+        self,
+        texts: Iterable,
+        target_lang: str,
+        page_name: str = "page",
+    ) -> int:
+        if not target_lang or target_lang == self.source_lang:
+            return 0
+
+        with self._lock:
+            self._ensure_storage(page_name, target_lang)
+            pending = self._load_pending()
+            bucket = pending.setdefault(target_lang, {})
+            added = 0
+
+            for item in texts:
+                if isinstance(item, tuple):
+                    if len(item) == 3:
+                        text, tag, attr_name = item
+                        prompt_type = self._resolve_prompt_type(tag, attr_name)
+                    elif len(item) == 2:
+                        text, prompt_type = item
+                    else:
+                        continue
+                else:
+                    text = item
+                    prompt_type = "normal"
+
+                if text is None:
+                    continue
+
+                _, core, _ = _split_preserve_whitespace(str(text))
+                if not core or not should_translate(core):
+                    continue
+                if core in self._cache or core in bucket:
+                    continue
+
+                bucket[core] = {"prompt_type": prompt_type}
+                added += 1
+
+            self._save_pending(pending)
+            return added
+
+    def get_pending_entries(self, target_lang: Optional[str] = None) -> Dict[str, Dict[str, Dict[str, str]]]:
+        pending = self._load_pending()
+        if target_lang:
+            return {target_lang: pending.get(target_lang, {})}
+        return pending
+
+    def process_pending_translations(
+        self,
+        target_lang: Optional[str] = None,
+        page_name: str = "page",
+        batch_size: int = 50,
+    ) -> int:
+        with self._lock:
+            pending = self._load_pending()
+            langs = [target_lang] if target_lang else list(pending.keys())
+            processed_total = 0
+
+            for lang in langs:
+                bucket = pending.get(lang, {})
+                if not bucket:
+                    continue
+
+                self._ensure_storage(page_name, lang)
+
+                items: List[Tuple[str, str]] = []
+                texts_for_remove: List[str] = []
+
+                for text, meta in bucket.items():
+                    if text in self._cache:
+                        texts_for_remove.append(text)
+                        continue
+
+                    prompt_type = meta.get("prompt_type", "normal") if isinstance(meta, dict) else "normal"
+                    items.append((text, prompt_type))
+                    if len(items) >= batch_size:
+                        break
+
+                for text in texts_for_remove:
+                    bucket.pop(text, None)
+
+                if not items:
+                    if not bucket:
+                        pending.pop(lang, None)
+                    continue
+
+                short_items = []
+                long_items = []
+
+                for text, prompt_type in items:
+                    if len(text) > 3000:
+                        long_items.append((text, prompt_type))
+                    else:
+                        short_items.append((text, prompt_type))
+
+                translated_map: Dict[str, str] = {}
+
+                if short_items:
+                    translated_map.update(self._translate_batch(short_items, lang))
+
+                for text, prompt_type in long_items:
+                    translated_map[text] = self._translate_single(text, lang, prompt_type=prompt_type)
+
+                if translated_map:
+                    self._cache.update(translated_map)
+                    self._save_storage()
+
+                    for text, _ in items:
+                        bucket.pop(text, None)
+
+                    processed_total += len(items)
+
+                if not bucket:
+                    pending.pop(lang, None)
+
+            self._save_pending(pending)
+            return processed_total
+
+    def run_translation_loop(
+        self,
+        interval: int = 300,
+        target_lang: Optional[str] = None,
+        page_name: str = "page",
+        stop_event: Optional[threading.Event] = None,
+    ) -> None:
+        if interval <= 0:
+            raise ValueError("interval must be > 0")
+
+        while True:
+            try:
+                self.process_pending_translations(
+                    target_lang=target_lang,
+                    page_name=page_name,
+                )
+            except Exception:
+                pass
+
+            if stop_event and stop_event.is_set():
+                break
+
+            time.sleep(interval)
+
+            if stop_event and stop_event.is_set():
+                break
+
     def translate_text(
         self,
         text: str,
@@ -403,10 +568,8 @@ class Translator:
         if core in self._cache:
             return f"{leading}{self._cache[core]}{trailing}"
 
-        translated = self._translate_single(core, target_lang, prompt_type=prompt_type)
-        self._cache[core] = translated
-        self._save_storage()
-        return f"{leading}{translated}{trailing}"
+        self.enqueue_missing_texts([(core, prompt_type)], target_lang=target_lang, page_name=page_name)
+        return original
 
     def translate_html(self, html: str, target_lang: str, page_name: str = "page") -> str:
         if target_lang == self.source_lang:
@@ -414,56 +577,29 @@ class Translator:
 
         self._ensure_storage(page_name, target_lang)
 
-        collected: List[Tuple[str, str]] = []
+        collected: List[Tuple[str, Optional[str], Optional[str]]] = []
         seen = set()
 
         def collector(text: str, tag: Optional[str], attr_name: Optional[str]) -> str:
-            prompt_type = "normal"
-            if tag == "button" or attr_name == "value":
-                prompt_type = "button"
-            elif attr_name is not None:
-                prompt_type = "attr"
-
             if text in self._cache:
                 return self._cache[text]
 
-            key = (text, prompt_type)
+            key = (text, tag, attr_name)
             if key not in seen:
                 seen.add(key)
                 collected.append(key)
 
             return text
 
-        # проход 1: собрать новые строки
         pre_parser = SimpleHTMLTranslator(translate_callback=collector)
         pre_parser.feed(html)
         pre_parser.close()
 
         if collected:
-            # длинные строки страхуем одиночным запросом
-            short_items = []
-            long_items = []
+            self.enqueue_missing_texts(collected, target_lang=target_lang, page_name=page_name)
 
-            for text, prompt_type in collected:
-                if len(text) > 3000:
-                    long_items.append((text, prompt_type))
-                else:
-                    short_items.append((text, prompt_type))
-
-            if short_items:
-                batch_result = self._translate_batch(short_items, target_lang)
-                self._cache.update(batch_result)
-
-            for text, prompt_type in long_items:
-                self._cache[text] = self._translate_single(text, target_lang, prompt_type=prompt_type)
-
-            self._save_storage()
-
-        # проход 2: подставить переводы
         def renderer(text: str, tag: Optional[str], attr_name: Optional[str]) -> str:
-            if text in self._cache:
-                return self._cache[text]
-            return text
+            return self._cache.get(text, text)
 
         parser = SimpleHTMLTranslator(translate_callback=renderer)
         parser.feed(html)
