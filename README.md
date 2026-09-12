@@ -1,436 +1,113 @@
 # auto-i18n-lib
 
-Lightweight post-render HTML translation for Python projects.
-
-auto-i18n-lib translates already-rendered HTML into the user's language with minimal integration effort.
-It is designed for projects where you want multilingual UI without rebuilding templates, database models, or business logic.
----
-
-## Why this library
-
-Most i18n solutions require you to:
-
-- mark strings in templates;
-- restructure project code;
-- maintain translation catalogs;
-- adapt data storage rules.
-
-This library uses a different approach:
-
-1. render HTML as usual;
-2. pass the final HTML through the translator;
-3. return translated HTML to the user.
-
-That makes it practical for:
-
-- existing projects;
-- legacy systems;
-- admin panels;
-- internal tools;
-- rapidly changing SaaS interfaces.
+**Автоматическая библиотека для перевода интерфейсов без ручного сбора строк.**
 
 ---
 
-## Features
+## Что содержит библиотека
 
-- Post-render HTML translation
-- Translation of:
-  - text nodes
-  - table content
-  - button labels
-  - `option`
-  - `textarea`
-  - selected attributes:
-    - `placeholder`
-    - `title`
-    - `alt`
-    - `aria-label`
-    - `value` for button-like inputs
-- Per-language JSON cache
-- Batch translation of new strings
-- Reuse of cached translations across pages
-- Backward-aware loading of legacy page-based cache files
-- Minimal project integration
-
-The current implementation is based on `HTMLParser`, the `Translator` class, local JSON cache saving, browser language detection, and OpenAI-based translation. :contentReference[oaicite:2]{index=2}
+- **Класс `Translator`** – публичное API для рендеринга и управления переводом.
+- **Воркер** – фоновый процесс, который:
+  - сканирует указанные файлы и папки (HTML, JS/JSX/TSX, UI-словари),
+  - извлекает все тексты интерфейса,
+  - переводит их через OpenAI,
+  - сохраняет в JSON-кэш,
+  - обновляет переводы при изменении кода.
+- **Парсеры** для HTML, JSX/TSX, UI-словарей (рекурсивный обход).
+- **Клиентский рантайм** – готовый JavaScript с функциями `translateKey()` и `setLanguage()` для динамического перевода DOM.
+- **Storage** – атомарное управление кэшем и очередями.
 
 ---
 
-## Installation
+## Что выполняет библиотека
 
-```bash
-pip install auto-i18n-lib
-
-
----
-
-## Requirements
-
-* Python 3.9+
-* OpenAI API key
-
-The package metadata currently requires Python `>=3.9`.  
+- **В фоне** – автоматически находит все строки в проекте, переводит на целевые языки, поддерживает кэш актуальным.
+- **При рендеринге** – методы `translate_html`, `translate_dict`, `translate_key` мгновенно отдают готовые переводы из локального кэша (без синхронных вызовов OpenAI).
+- **На клиенте** – смена языка подгружает новый JSON и перерисовывает интерфейс без перезагрузки страницы.
 
 ---
 
-## Environment variables
-
-You can configure the translator through constructor arguments or environment variables.
-
-### Supported environment variables
-
-* `OPENAI_API_KEY` — your OpenAI API key
-* `SOURCE_LANG` — source language of your project content
-
-Example:
-
-```bash
-export OPENAI_API_KEY="your_key"
-export SOURCE_LANG="ru"
-```
-
-Or on Windows PowerShell:
-
-```powershell
-$env:OPENAI_API_KEY="your_key"
-$env:SOURCE_LANG="ru"
-```
-
-Note: `source_lang` is read from `SOURCE_LANG` if not provided explicitly in the constructor. This behavior is implemented in the current `Translator` class. 
-
----
-
-## Quick start
+## Быстрый старт
 
 ```python
 from autoi18n import Translator
 
-translator = Translator(
+t = Translator(
     api_key="YOUR_OPENAI_API_KEY",
-    cache_dir="./translations",
     source_lang="ru",
+    target_langs=["en", "uk", "az", "tr"],
+    # Пути для сканирования
+    js_globs=["frontend/src/**/*.{js,jsx,tsx}"],
+    html_globs=["templates/**/*.html"],
 )
 
-html = """
-<h1>Добро пожаловать</h1>
-<p>Это тестовая страница</p>
-<button>Сохранить</button>
-"""
-
-translated_html = translator.translate_html(
-    html=html,
-    target_lang="en",
-    page_name="home",
-)
-
-print(translated_html)
+# Запустить воркер (один раз или в фоновом потоке)
+t.run_translation_loop(interval=300)  # каждые 5 минут
 ```
 
 ---
 
-## Basic usage
+## Методы рендеринга
 
-### Translate plain text
-
-```python
-from autoi18n import Translator
-
-translator = Translator(
-    api_key="YOUR_OPENAI_API_KEY",
-    cache_dir="./translations",
-    source_lang="ru",
-)
-
-result = translator.translate_text(
-    text="Привет, мир!",
-    target_lang="en",
-    page_name="common",
-)
-
-print(result)
-```
-
-### Translate HTML
-
-```python
-from autoi18n import Translator
-
-translator = Translator(
-    api_key="YOUR_OPENAI_API_KEY",
-    cache_dir="./translations",
-    source_lang="ru",
-)
-
-html = """
-<form>
-    <label>Имя</label>
-    <input type="text" placeholder="Введите имя">
-    <textarea placeholder="Введите комментарий"></textarea>
-    <input type="submit" value="Отправить">
-</form>
-"""
-
-translated_html = translator.translate_html(
-    html=html,
-    target_lang="en",
-    page_name="form_page",
-)
-
-print(translated_html)
-```
+| Метод | Назначение |
+|-------|------------|
+| `translate_html(html, target_lang, page_name)` | Переводит готовый HTML (текст и атрибуты). |
+| `translate_dict(page_name, dict_name, source_dict, target_lang)` | Переводит вложенный словарь (UI). |
+| `translate_key(key, lang, default, dict_name)` | Возвращает перевод бэкенд-фразы по ключу. |
+| `register_keys(items, dict_name)` | Регистрирует исходные бэкенд-фразы. |
+| `build_frontend_runtime(lang)` | Генерирует JS-рантайм для клиента. |
 
 ---
 
-## FastAPI example
+## Пример интеграции с React
 
-```python
-from fastapi import FastAPI, Request
-from fastapi.responses import HTMLResponse
-from autoi18n import Translator
+1. **Настройте `Translator` с путями к вашему фронтенду.**
+2. **Запустите воркер** – он сам найдёт все строки в компонентах (включая JSX-тексты, атрибуты, вызовы `t()`).
+3. **Вставьте сгенерированный рантайм** в `index.html`:
+   ```html
+   <script>
+   // Результат t.build_frontend_runtime('ru')
+   </script>
+   ```
+4. **В компонентах используйте**:
+   ```jsx
+   // Любой текст, обёрнутый в translateKey, будет автоматически переведён
+   <h1>{window.autoI18n.translateKey('dashboard_welcome', 'Добро пожаловать')}</h1>
+   ```
+   Или атрибут `data-i18n="dashboard_welcome"` на любом элементе.
 
-app = FastAPI()
-
-translator = Translator(
-    api_key="YOUR_OPENAI_API_KEY",
-    cache_dir="./translations",
-    source_lang="ru",
-)
-
-@app.get("/", response_class=HTMLResponse)
-async def index(request: Request):
-    html = """
-    <h1>Главная страница</h1>
-    <p>Добро пожаловать в систему</p>
-    <button>Продолжить</button>
-    """
-
-    accept_language = request.headers.get("accept-language", "")
-    target_lang = translator.detect_browser_lang(accept_language)
-
-    translated_html = translator.translate_html(
-        html=html,
-        target_lang=target_lang,
-        page_name="index",
-    )
-    return translated_html
-```
+5. **Переключение языка**:
+   ```js
+   window.autoI18n.setLanguage('en');
+   ```
 
 ---
 
-## Flask example
+## Переменные окружения
 
-```python
-from flask import Flask, request
-from autoi18n import Translator
-
-app = Flask(__name__)
-
-translator = Translator(
-    api_key="YOUR_OPENAI_API_KEY",
-    cache_dir="./translations",
-    source_lang="ru",
-)
-
-@app.route("/")
-def index():
-    html = """
-    <h1>Панель управления</h1>
-    <p>Здесь отображается основная информация</p>
-    """
-
-    accept_language = request.headers.get("Accept-Language", "")
-    target_lang = translator.detect_browser_lang(accept_language)
-
-    return translator.translate_html(
-        html=html,
-        target_lang=target_lang,
-        page_name="dashboard",
-    )
-```
+| Переменная | Описание |
+|------------|----------|
+| `OPENAI_API_KEY` | Обязательный API‑ключ |
+| `SOURCE_LANG` | Исходный язык (по умолчанию `ru`) |
+| `AUTO_I18N_TARGET_LANGS` | Целевые языки через запятую |
+| `AUTO_I18N_JS_GLOBS` | Glob-паттерны для JS/JSX (JSON-массив) |
+| `AUTO_I18N_HTML_GLOBS` | Glob-паттерны для HTML |
+| `AUTO_I18N_CACHE_DIR` | Папка для кэша (по умолчанию `./cache`) |
+| `AUTO_I18N_DYNAMIC_DOM_ENABLED` | Включить MutationObserver |
 
 ---
 
-## Typical integration pattern
+## Требования к доработке (ТЗ)
 
-```python
-html = render_template(...)
-translated_html = translator.translate_html(
-    html=html,
-    target_lang=user_lang,
-    page_name="some_page",
-)
-return translated_html
-```
+Чтобы библиотека работала **полностью автоматически**, необходимо:
 
-This keeps:
-
-* templates unchanged;
-* business logic unchanged;
-* database schema unchanged.
+1. **Улучшенный JSX-парсер** – должен находить все текстовые узлы в JSX, атрибуты (`label`, `placeholder`, `title`, `aria-label`), вызовы `t()` и `translateKey()` в любом синтаксисе (включая шаблонные строки и переменные).
+2. **Автоматическое обновление переводов** – воркер должен пересканивать файлы при их изменении (watch mode) и переводить только новые/изменённые строки.
+3. **Клиентский рантайм** – должен уметь подгружать переводы по требованию (lazy loading) и работать с React без дополнительных обёрток.
+4. **Поддержка динамических атрибутов** – `data-i18n` должен работать для любых атрибутов, а не только для текста.
 
 ---
 
-## What is translated
-
-The current implementation processes:
-
-* regular visible text nodes;
-* table text;
-* form-related visible text;
-* selected UI attributes;
-* button-like input values.
-
-These behaviors are implemented in the current parser and translator logic. 
-
----
-
-## What is not translated
-
-The current implementation intentionally skips:
-
-* `script`
-* `style`
-* `noscript`
-* elements with:
-
-  * `translate="no"`
-  * `data-translate="no"`
-  * `id="langSwitch"`
-
-It also skips values that look like:
-
-* empty or whitespace-only content;
-* pure numbers;
-* number-like strings;
-* UUID/hash-like strings;
-* many technical Latin-only identifiers, paths, and codes.
-
-These skip rules are explicitly present in the current code. 
-
----
-
-## Cache behavior
-
-Translations are stored as JSON files in the cache directory.
-
-### Current cache format
-
-One file per target language, for example:
-
-* `translations/en.json`
-* `translations/de.json`
-* `translations/az.json`
-
-This allows the same translated strings to be reused across different pages.
-
-### Legacy cache compatibility
-
-Older versions could store cache in page-based files such as:
-
-* `home.en.json`
-* `profile.de.json`
-
-The current version can read legacy page-based cache files and merge them into the new language-level cache automatically. This behavior is implemented by `_legacy_file_path()`, `_file_path()`, and `_load_storage()`. 
-
----
-
-## Constructor
-
-```python
-Translator(
-    cache_dir="./translations",
-    api_key=None,
-    source_lang=None,
-    model="gpt-4o-mini",
-)
-```
-
-### Parameters
-
-* `cache_dir` — directory for translation cache files
-* `api_key` — OpenAI API key
-* `source_lang` — source language of the original project content
-* `model` — OpenAI model used for translation
-
-The current default model is `gpt-4o-mini`. 
-
----
-
-## Public API
-
-### `translate_text(text, target_lang, page_name="page", prompt_type="normal")`
-
-Translates a single text string.
-
-### `translate_html(html, target_lang, page_name="page")`
-
-Translates rendered HTML while preserving HTML structure.
-
-### `detect_browser_lang(accept_language)`
-
-Extracts the primary browser language from the `Accept-Language` header.
-
-### `get_alternative_lang(current_lang, browser_lang)`
-
-Returns an alternative language value for language switch logic.
-
-These public methods exist in the current `Translator` class. 
-
----
-
-## Upgrade notes
-
-### What changed in the new version
-
-* translation coverage was expanded;
-* table content is translated;
-* form-related UI text is translated;
-* useful attributes are translated;
-* new strings are translated in batches;
-* cache storage is language-based;
-* old cache entries are no longer deleted during page rendering.
-
-### Why this changed
-
-The new behavior improves:
-
-* translation completeness;
-* cache stability;
-* reuse across pages;
-* overall translation efficiency.
-
-### Migration impact
-
-In many projects, integration code can remain unchanged.
-
-Possible differences after upgrade:
-
-* cache files may now be created as `translations/<lang>.json`;
-* old page-specific cache layout may no longer be the only active cache format;
-* custom scripts that depend on page-based cache naming may need adjustment.
-
----
-
-## Recommended content rule
-
-For better translation quality and more stable terminology, it is recommended to keep structured business data normalized and consistent.
-
-In many projects, English is the most convenient base language for structured reference values and reusable business terms.
-
----
-
-## Limitations
-
-* The library translates rendered HTML, not source templates.
-* Translation quality depends on source text quality.
-* Highly dynamic or fragmented HTML may reduce cache efficiency.
-* This library is intended as a pragmatic i18n layer, not a full replacement for every localization workflow.
-
----
-
-## License
+## Лицензия
 
 MIT
-
-See the `LICENSE` file included in the package structure. 
-

@@ -1,238 +1,45 @@
-import json
+# src/autoi18n/translator.py
 import os
-import re
-import tempfile
 import threading
-import time
-from html import escape
-from html.parser import HTMLParser
-from typing import Callable, Dict, Iterable, List, Optional, Tuple
+import logging
+from typing import Any, Dict, List, Optional, Tuple
 
-from openai import OpenAI
+from .storage import Storage
+from .worker import Worker
+from .page_registry import PageRegistry
+from .ai_translator import get_translator, BaseTranslator
 
+# Обновлённые импорты из парсеров
+from .parsers.html_parser import (
+    SimpleHTMLTranslator,
+    collect_translatable_items,
+    resolve_prompt_type,
+)
+from .parsers.js_parser import extract_js_keys_from_content, extract_js_keys_from_files
 
-SKIP_TAGS = {"script", "style", "noscript"}
-TRANSLATABLE_ATTRS = {"placeholder", "title", "alt", "aria-label"}
-BUTTON_VALUE_TYPES = {"button", "submit", "reset"}
+from .runtime import build_frontend_runtime_script
+from .utils import (
+    build_lang_chain,
+    normalize_lang,
+    normalize_backend_dict_name,
+    parse_target_langs,
+    parse_bool,
+    parse_json_or_csv_list,
+    resolve_glob_paths,
+    should_translate,
+    should_translate_ui_text,
+    should_translate_backend_text,
+    split_preserve_whitespace,
+    text_hash,
+    load_keys_mapping,
+    save_keys_mapping,
+    deep_copy_json_like,
+    replace_translatable_strings,
+)
 
-WHITESPACE_ONLY_RE = re.compile(r"^\s*$")
-NUMBER_LIKE_RE = re.compile(r"^[\d\s\.,:/\-]+$")
-HEX_LIKE_RE = re.compile(r"^[A-Fa-f0-9\-]{8,}$")
-PURE_LATIN_TECH_RE = re.compile(r"^[A-Za-z0-9_\-\s\.:/@#%+=]+$")
-
-PENDING_FILENAME = "_pending.json"
-
-
-def _split_preserve_whitespace(text: str) -> Tuple[str, str, str]:
-    match = re.match(r"^(\s*)(.*?)(\s*)$", text, flags=re.DOTALL)
-    if not match:
-        return "", text, ""
-    return match.group(1), match.group(2), match.group(3)
-
-
-def should_translate(text: str, tag: Optional[str] = None, attr_name: Optional[str] = None) -> bool:
-    if text is None:
-        return False
-
-    raw = text
-    text = text.strip()
-
-    if not text:
-        return False
-
-    if WHITESPACE_ONLY_RE.fullmatch(raw):
-        return False
-
-    if text.isdigit():
-        return False
-    if NUMBER_LIKE_RE.fullmatch(text):
-        return False
-
-    if HEX_LIKE_RE.fullmatch(text):
-        return False
-
-    if PURE_LATIN_TECH_RE.fullmatch(text):
-        if attr_name in TRANSLATABLE_ATTRS or attr_name == "value":
-            words = text.split()
-            if len(words) >= 2:
-                return True
-        return False
-
-    return True
-
-
-def _safe_json_load(path: str):
-    if not os.path.exists(path):
-        return {}
-    try:
-        with open(path, "r", encoding="utf-8") as f:
-            data = json.load(f)
-        return data if isinstance(data, dict) else {}
-    except Exception:
-        return {}
-
-
-def _safe_json_save(path: str, data) -> None:
-    directory = os.path.dirname(path) or "."
-    os.makedirs(directory, exist_ok=True)
-
-    fd, tmp_path = tempfile.mkstemp(prefix=".tmp_autoi18n_", suffix=".json", dir=directory)
-    try:
-        with os.fdopen(fd, "w", encoding="utf-8") as f:
-            json.dump(data, f, ensure_ascii=False, indent=2, sort_keys=True)
-            f.flush()
-            os.fsync(f.fileno())
-        os.replace(tmp_path, path)
-    finally:
-        if os.path.exists(tmp_path):
-            try:
-                os.remove(tmp_path)
-            except OSError:
-                pass
-
-
-def _extract_json(text: str):
-    text = text.strip()
-    if not text:
-        raise ValueError("Empty model response")
-
-    try:
-        return json.loads(text)
-    except Exception:
-        pass
-
-    start_obj = text.find("{")
-    end_obj = text.rfind("}")
-    if start_obj != -1 and end_obj != -1 and end_obj > start_obj:
-        candidate = text[start_obj:end_obj + 1]
-        try:
-            return json.loads(candidate)
-        except Exception:
-            pass
-
-    start_arr = text.find("[")
-    end_arr = text.rfind("]")
-    if start_arr != -1 and end_arr != -1 and end_arr > start_arr:
-        candidate = text[start_arr:end_arr + 1]
-        return json.loads(candidate)
-
-    raise ValueError("JSON not found in model response")
-
-
-class SimpleHTMLTranslator(HTMLParser):
-    def __init__(self, translate_callback: Callable[[str, Optional[str], Optional[str]], str]):
-        super().__init__(convert_charrefs=False)
-        self.result: List[str] = []
-        self.translate_callback = translate_callback
-        self.tag_stack: List[str] = []
-        self.skip_stack: List[bool] = []
-        self.skip_depth = 0
-
-    @property
-    def current_tag(self) -> Optional[str]:
-        return self.tag_stack[-1] if self.tag_stack else None
-
-    def _should_skip_tag(self, tag: str, attrs: List[Tuple[str, Optional[str]]]) -> bool:
-        if tag in SKIP_TAGS:
-            return True
-
-        attrs_dict = {k: v for k, v in attrs}
-        if attrs_dict.get("id") == "langSwitch":
-            return True
-        if attrs_dict.get("translate") == "no":
-            return True
-        if attrs_dict.get("data-translate") == "no":
-            return True
-        return False
-
-    def _render_starttag(self, tag: str, attrs: List[Tuple[str, Optional[str]]], closing: str = ">") -> str:
-        rendered_attrs = []
-
-        attrs_dict = {k: v for k, v in attrs}
-        input_type = (attrs_dict.get("type") or "").strip().lower()
-
-        for name, value in attrs:
-            if value is None:
-                rendered_attrs.append(name)
-                continue
-
-            new_value = value
-
-            if self.skip_depth == 0:
-                if name in TRANSLATABLE_ATTRS and should_translate(value, tag=tag, attr_name=name):
-                    new_value = self.translate_callback(value, tag, name)
-
-                elif (
-                    tag == "input"
-                    and name == "value"
-                    and input_type in BUTTON_VALUE_TYPES
-                    and should_translate(value, tag=tag, attr_name=name)
-                ):
-                    new_value = self.translate_callback(value, tag, name)
-
-            rendered_attrs.append(f'{name}="{escape(new_value, quote=True)}"')
-
-        if rendered_attrs:
-            return f"<{tag} {' '.join(rendered_attrs)}{closing}"
-        return f"<{tag}{closing}"
-
-    def handle_starttag(self, tag, attrs):
-        skip_this_tag = self._should_skip_tag(tag, attrs)
-        self.result.append(self._render_starttag(tag, attrs, closing=">"))
-        self.tag_stack.append(tag)
-        self.skip_stack.append(skip_this_tag)
-        if skip_this_tag:
-            self.skip_depth += 1
-
-    def handle_startendtag(self, tag, attrs):
-        self.result.append(self._render_starttag(tag, attrs, closing=" />"))
-
-    def handle_endtag(self, tag):
-        self.result.append(f"</{tag}>")
-        if self.tag_stack:
-            self.tag_stack.pop()
-        if self.skip_stack:
-            skip_this_tag = self.skip_stack.pop()
-            if skip_this_tag and self.skip_depth > 0:
-                self.skip_depth -= 1
-
-    def handle_data(self, data):
-        if self.skip_depth > 0:
-            self.result.append(data)
-            return
-
-        if not should_translate(data, tag=self.current_tag):
-            self.result.append(data)
-            return
-
-        leading, core, trailing = _split_preserve_whitespace(data)
-        if not core:
-            self.result.append(data)
-            return
-
-        translated = self.translate_callback(core, self.current_tag, None)
-        self.result.append(f"{leading}{translated}{trailing}")
-
-    def handle_entityref(self, name):
-        self.result.append(f"&{name};")
-
-    def handle_charref(self, name):
-        self.result.append(f"&#{name};")
-
-    def handle_comment(self, data):
-        self.result.append(f"<!--{data}-->")
-
-    def handle_decl(self, decl):
-        self.result.append(f"<!{decl}>")
-
-    def handle_pi(self, data):
-        self.result.append(f"<?{data}>")
-
-    def unknown_decl(self, data):
-        self.result.append(f"<![{data}]>")
-
-    def get_html(self) -> str:
-        return "".join(self.result)
+# ---------- Логирование (отключаемое) ----------
+logger = logging.getLogger(__name__)
+logger.addHandler(logging.NullHandler())
 
 
 class Translator:
@@ -242,383 +49,384 @@ class Translator:
         api_key: Optional[str] = None,
         source_lang: Optional[str] = None,
         model: str = "gpt-4o-mini",
+        target_langs: Optional[List[str]] = None,
+        ai_provider: str = "openai",
+        ai_config: Optional[Dict[str, Any]] = None,
     ):
-        self.source_lang = source_lang or os.getenv("SOURCE_LANG", "ru")
-        self.cache_dir = cache_dir
-        self.client = OpenAI(api_key=api_key)
-        self.model = model
+        """
+        Инициализация основного класса перевода.
 
-        self._current_lang: Optional[str] = None
-        self._current_page_name: Optional[str] = None
-        self._current_file: Optional[str] = None
-        self._cache: Dict[str, str] = {}
+        Args:
+            cache_dir: Директория для хранения кэша переводов.
+            api_key: API ключ для OpenAI (если не указан, берётся из OPENAI_API_KEY).
+            source_lang: Исходный язык (по умолчанию 'ru').
+            model: Модель OpenAI (по умолчанию 'gpt-4o-mini').
+            target_langs: Список целевых языков.
+            ai_provider: Провайдер AI (пока только 'openai').
+            ai_config: Дополнительная конфигурация для провайдера (например, max_retries, retry_delay).
+        """
+        self.source_lang = normalize_lang(source_lang or os.getenv("SOURCE_LANG", "ru"))
+        self.cache_dir = cache_dir
+        self.target_langs = parse_target_langs(target_langs, source_lang=self.source_lang)
+        self.js_globs = parse_json_or_csv_list(os.getenv("AUTO_I18N_JS_GLOBS"))
+        self.dynamic_dom_enabled = parse_bool(os.getenv("AUTO_I18N_DYNAMIC_DOM_ENABLED"), default=False)
+        self.fallback_lang = self._normalize_lang(os.getenv("AUTO_I18N_FALLBACK_LANG", self.source_lang))
+
+        self._storage = Storage(cache_dir, self.source_lang)
+
+        # Создаём AI-переводчик через фабрику
+        ai_provider = ai_provider or os.getenv("AUTO_I18N_AI_PROVIDER", "openai")
+        ai_config = ai_config or {}
+        # Если не передан api_key в ai_config, используем из параметров или переменной окружения
+        if "api_key" not in ai_config:
+            ai_config["api_key"] = api_key or os.getenv("OPENAI_API_KEY")
+        if "model" not in ai_config:
+            ai_config["model"] = model
+        if "source_lang" not in ai_config:
+            ai_config["source_lang"] = self.source_lang
+        if "target_langs" not in ai_config:
+            ai_config["target_langs"] = self.target_langs
+
+        self.translator: BaseTranslator = get_translator(ai_provider, ai_config)
+
+        # Создаём воркер с переводчиком
+        self._worker = Worker(self._storage, self.translator, self.source_lang)
+        self._page_registry = PageRegistry()
         self._lock = threading.RLock()
 
-    def _legacy_file_path(self, page_name: str, lang: str) -> str:
-        return os.path.join(self.cache_dir, f"{page_name}.{lang}.json")
+    def _normalize_lang(self, lang: Optional[str]) -> str:
+        return normalize_lang(lang, source_lang=self.source_lang)
 
-    def _file_path(self, lang: str) -> str:
-        return os.path.join(self.cache_dir, f"{lang}.json")
+    def _get_lang_chain(self, target_lang: str) -> List[str]:
+        return build_lang_chain(target_lang=target_lang, source_lang=self.source_lang)
 
-    def _pending_file_path(self) -> str:
-        return os.path.join(self.cache_dir, PENDING_FILENAME)
+    def _resolve_target_langs(self, target_langs: Optional[List[str]] = None) -> List[str]:
+        langs = parse_target_langs(target_langs, source_lang=self.source_lang)
+        return langs if langs else list(self.target_langs)
 
-    def _load_pending(self) -> Dict[str, Dict[str, Dict[str, str]]]:
-        data = _safe_json_load(self._pending_file_path())
-        result: Dict[str, Dict[str, Dict[str, str]]] = {}
+    def _load_shared_cache(self, lang: str) -> Dict[str, str]:
+        return self._storage.load_cache("shared", lang)
 
-        for lang, items in data.items():
-            if not isinstance(lang, str) or not isinstance(items, dict):
-                continue
+    def _load_backend_cache(self, dict_name: str, lang: str) -> Dict[str, str]:
+        return self._storage.load_cache(dict_name, lang)
 
-            lang_bucket: Dict[str, Dict[str, str]] = {}
-            for text, meta in items.items():
-                if not isinstance(text, str):
-                    continue
+    def _get_from_shared_chain(self, key: str, target_lang: str) -> Optional[str]:
+        for lang in self._get_lang_chain(target_lang):
+            cache = self._load_shared_cache(lang)
+            if key in cache:
+                return cache[key]
+        return None
 
-                if isinstance(meta, dict):
-                    prompt_type = str(meta.get("prompt_type") or "normal")
-                else:
-                    prompt_type = "normal"
+    def _get_from_backend_chain(self, key: str, dict_name: str, target_lang: str) -> Optional[str]:
+        for lang in self._get_lang_chain(target_lang):
+            cache = self._load_backend_cache(dict_name, lang)
+            if key in cache:
+                return cache[key]
+        return None
 
-                lang_bucket[text] = {"prompt_type": prompt_type}
+    def _ensure_key_mapped(self, text: str) -> str:
+        mapping = load_keys_mapping(self.cache_dir)
+        h = text_hash(text)
+        if h not in mapping:
+            mapping[h] = text
+            save_keys_mapping(self.cache_dir, mapping)
+        return h
 
-            if lang_bucket:
-                result[lang] = lang_bucket
+    def register_page(self, page_name: str, html_getter, target_langs: List[str], context: Optional[Dict[str, Any]] = None) -> None:
+        normalized = [self._normalize_lang(l) for l in target_langs]
+        self._page_registry.register_page(page_name, html_getter, normalized, context or {})
 
-        return result
-
-    def _save_pending(self, data: Dict[str, Dict[str, Dict[str, str]]]) -> None:
-        cleaned = {lang: items for lang, items in data.items() if items}
-        _safe_json_save(self._pending_file_path(), cleaned)
-
-    def _load_storage(self, page_name: str, lang: str) -> None:
-        target_path = self._file_path(lang)
-        cache = _safe_json_load(target_path)
-
-        legacy_path = self._legacy_file_path(page_name, lang)
-        legacy_cache = _safe_json_load(legacy_path)
-
-        if legacy_cache:
-            cache.update({k: v for k, v in legacy_cache.items() if k not in cache})
-            _safe_json_save(target_path, cache)
-
-        self._cache = cache
-        self._current_file = target_path
-        self._current_lang = lang
-        self._current_page_name = page_name
-
-    def _ensure_storage(self, page_name: str, lang: str) -> None:
-        if self._current_lang != lang or not self._current_file:
-            self._load_storage(page_name, lang)
-
-    def _save_storage(self) -> None:
-        if self._current_file:
-            _safe_json_save(self._current_file, self._cache)
-
-    def _build_single_prompt(self, text: str, target_lang: str, prompt_type: str = "normal") -> str:
-        if prompt_type == "button":
-            return (
-                f"Translate the UI button label from {self.source_lang} to {target_lang}. "
-                f"Return only the translation, without explanations.\n\n{text}"
-            )
-
-        if prompt_type == "attr":
-            return (
-                f"Translate the UI attribute text from {self.source_lang} to {target_lang}. "
-                f"Return only the translation, without explanations.\n\n{text}"
-            )
-
-        return (
-            f"Translate the text from {self.source_lang} to {target_lang}. "
-            f"Return only the translation, without explanations.\n\n{text}"
-        )
-
-    def _translate_via_api(self, prompt: str) -> str:
-        response = self.client.chat.completions.create(
-            model=self.model,
-            messages=[{"role": "user", "content": prompt}],
-        )
-        return (response.choices[0].message.content or "").strip()
-
-    def _translate_single(self, text: str, target_lang: str, prompt_type: str = "normal") -> str:
-        prompt = self._build_single_prompt(text, target_lang, prompt_type)
-        translated = self._translate_via_api(prompt)
-        return translated or text
-
-    def _translate_batch(self, items: List[Tuple[str, str]], target_lang: str) -> Dict[str, str]:
-        if not items:
-            return {}
-
-        payload = [
-            {"id": i, "text": text, "kind": prompt_type}
-            for i, (text, prompt_type) in enumerate(items, start=1)
-        ]
-
-        prompt = (
-            f"Translate each item from {self.source_lang} to {target_lang}.\n"
-            f"Rules:\n"
-            f"- Return STRICT JSON object only.\n"
-            f"- Format: {{\"items\": [{{\"id\": 1, \"translated\": \"...\"}}]}}\n"
-            f"- Keep meaning precise.\n"
-            f"- For buttons and UI labels keep text concise.\n"
-            f"- Do not omit any item.\n"
-            f"- Do not add comments.\n\n"
-            f"Input JSON:\n{json.dumps(payload, ensure_ascii=False)}"
-        )
-
-        raw = self._translate_via_api(prompt)
-        parsed = _extract_json(raw)
-
-        result: Dict[str, str] = {}
-        translated_items = parsed.get("items", []) if isinstance(parsed, dict) else []
-
-        by_id = {}
-        for item in translated_items:
-            if not isinstance(item, dict):
-                continue
-            item_id = item.get("id")
-            translated = item.get("translated")
-            if isinstance(item_id, int) and isinstance(translated, str):
-                by_id[item_id] = translated.strip()
-
-        for idx, (text, _) in enumerate(items, start=1):
-            result[text] = by_id.get(idx) or text
-
-        return result
-
-    def _resolve_prompt_type(self, tag: Optional[str], attr_name: Optional[str]) -> str:
-        if tag == "button" or attr_name == "value":
-            return "button"
-        if attr_name is not None:
-            return "attr"
-        return "normal"
-
-    def enqueue_missing_texts(
-        self,
-        texts: Iterable,
-        target_lang: str,
-        page_name: str = "page",
-    ) -> int:
-        if not target_lang or target_lang == self.source_lang:
+    def register_keys(self, items: Dict[str, str], dict_name: str = "bot", target_langs: Optional[List[str]] = None) -> int:
+        dict_name = normalize_backend_dict_name(dict_name)
+        if not isinstance(items, dict):
+            raise TypeError("items must be a dict")
+        langs = self._resolve_target_langs(target_langs)
+        if not langs:
             return 0
-
-        with self._lock:
-            self._ensure_storage(page_name, target_lang)
-            pending = self._load_pending()
-            bucket = pending.setdefault(target_lang, {})
-            added = 0
-
-            for item in texts:
-                if isinstance(item, tuple):
-                    if len(item) == 3:
-                        text, tag, attr_name = item
-                        prompt_type = self._resolve_prompt_type(tag, attr_name)
-                    elif len(item) == 2:
-                        text, prompt_type = item
-                    else:
-                        continue
-                else:
-                    text = item
-                    prompt_type = "normal"
-
-                if text is None:
-                    continue
-
-                _, core, _ = _split_preserve_whitespace(str(text))
-                if not core or not should_translate(core):
-                    continue
-                if core in self._cache or core in bucket:
-                    continue
-
-                bucket[core] = {"prompt_type": prompt_type}
-                added += 1
-
-            self._save_pending(pending)
-            return added
-
-    def get_pending_entries(self, target_lang: Optional[str] = None) -> Dict[str, Dict[str, Dict[str, str]]]:
-        pending = self._load_pending()
-        if target_lang:
-            return {target_lang: pending.get(target_lang, {})}
-        return pending
-
-    def process_pending_translations(
-        self,
-        target_lang: Optional[str] = None,
-        page_name: str = "page",
-        batch_size: int = 50,
-    ) -> int:
-        with self._lock:
-            pending = self._load_pending()
-            langs = [target_lang] if target_lang else list(pending.keys())
-            processed_total = 0
-
+        source_cache = self._load_backend_cache(dict_name, self.source_lang)
+        pending = self._storage.load_pending(dict_name)
+        added = 0
+        for key, default_text in items.items():
+            if default_text is None:
+                continue
+            normalized_key = str(key).strip()
+            normalized_text = str(default_text).strip()
+            if not normalized_key or not normalized_text or not should_translate_backend_text(normalized_text):
+                continue
+            h = self._ensure_key_mapped(normalized_text)
+            source_cache[h] = normalized_text
             for lang in langs:
-                bucket = pending.get(lang, {})
-                if not bucket:
+                if lang == self.source_lang:
                     continue
-
-                self._ensure_storage(page_name, lang)
-
-                items: List[Tuple[str, str]] = []
-                texts_for_remove: List[str] = []
-
-                for text, meta in bucket.items():
-                    if text in self._cache:
-                        texts_for_remove.append(text)
-                        continue
-
-                    prompt_type = meta.get("prompt_type", "normal") if isinstance(meta, dict) else "normal"
-                    items.append((text, prompt_type))
-                    if len(items) >= batch_size:
-                        break
-
-                for text in texts_for_remove:
-                    bucket.pop(text, None)
-
-                if not items:
-                    if not bucket:
-                        pending.pop(lang, None)
+                lang_cache = self._load_backend_cache(dict_name, lang)
+                lang_bucket = pending.setdefault(lang, {})
+                if h in lang_cache or h in lang_bucket:
                     continue
-
-                short_items = []
-                long_items = []
-
-                for text, prompt_type in items:
-                    if len(text) > 3000:
-                        long_items.append((text, prompt_type))
-                    else:
-                        short_items.append((text, prompt_type))
-
-                translated_map: Dict[str, str] = {}
-
-                if short_items:
-                    translated_map.update(self._translate_batch(short_items, lang))
-
-                for text, prompt_type in long_items:
-                    translated_map[text] = self._translate_single(text, lang, prompt_type=prompt_type)
-
-                if translated_map:
-                    self._cache.update(translated_map)
-                    self._save_storage()
-
-                    for text, _ in items:
-                        bucket.pop(text, None)
-
-                    processed_total += len(items)
-
-                if not bucket:
-                    pending.pop(lang, None)
-
-            self._save_pending(pending)
-            return processed_total
-
-    def run_translation_loop(
-        self,
-        interval: int = 300,
-        target_lang: Optional[str] = None,
-        page_name: str = "page",
-        stop_event: Optional[threading.Event] = None,
-    ) -> None:
-        if interval <= 0:
-            raise ValueError("interval must be > 0")
-
-        while True:
-            try:
-                self.process_pending_translations(
-                    target_lang=target_lang,
-                    page_name=page_name,
-                )
-            except Exception:
-                pass
-
-            if stop_event and stop_event.is_set():
-                break
-
-            time.sleep(interval)
-
-            if stop_event and stop_event.is_set():
-                break
-
-    def translate_text(
-        self,
-        text: str,
-        target_lang: str,
-        page_name: str = "page",
-        prompt_type: str = "normal",
-    ) -> str:
-        if text is None:
-            return text
-
-        original = text
-        leading, core, trailing = _split_preserve_whitespace(original)
-
-        if not core:
-            return original
-
-        if target_lang == self.source_lang:
-            return original
-
-        self._ensure_storage(page_name, target_lang)
-
-        if not should_translate(core):
-            return original
-
-        if core in self._cache:
-            return f"{leading}{self._cache[core]}{trailing}"
-
-        self.enqueue_missing_texts([(core, prompt_type)], target_lang=target_lang, page_name=page_name)
-        return original
+                lang_bucket[h] = {"text": normalized_text, "prompt_type": "backend"}
+                added += 1
+        self._storage.save_cache(dict_name, self.source_lang, source_cache)
+        self._storage.save_pending(dict_name, pending)
+        return added
 
     def translate_html(self, html: str, target_lang: str, page_name: str = "page") -> str:
+        target_lang = self._normalize_lang(target_lang)
         if target_lang == self.source_lang:
             return html
 
-        self._ensure_storage(page_name, target_lang)
+        # Собираем обычные тексты из HTML (для очереди)
+        items = collect_translatable_items(html, self.cache_dir)
+        pending = self._storage.load_pending("shared")
+        bucket = pending.setdefault(target_lang, {})
+        for item in items:
+            h = item["hash"]
+            if h not in bucket:
+                bucket[h] = {"text": item["text"], "prompt_type": "normal"}
+        if bucket:
+            self._storage.save_pending("shared", pending)
 
-        collected: List[Tuple[str, Optional[str], Optional[str]]] = []
-        seen = set()
-
-        def collector(text: str, tag: Optional[str], attr_name: Optional[str]) -> str:
-            if text in self._cache:
-                return self._cache[text]
-
-            key = (text, tag, attr_name)
-            if key not in seen:
-                seen.add(key)
-                collected.append(key)
-
-            return text
-
-        pre_parser = SimpleHTMLTranslator(translate_callback=collector)
-        pre_parser.feed(html)
-        pre_parser.close()
-
-        if collected:
-            self.enqueue_missing_texts(collected, target_lang=target_lang, page_name=page_name)
-
-        def renderer(text: str, tag: Optional[str], attr_name: Optional[str]) -> str:
-            return self._cache.get(text, text)
-
-        parser = SimpleHTMLTranslator(translate_callback=renderer)
+        # Парсим HTML для рендера, попутно собираем скрипты
+        cache = self._load_shared_cache(target_lang)
+        parser = SimpleHTMLTranslator(
+            translate_callback=lambda t, tag, attr: cache.get(text_hash(t), t) if t and should_translate(t) else t
+        )
         parser.feed(html)
         parser.close()
-        return parser.get_html()
+
+        # Обрабатываем скрипты (используем обновлённый парсер JS)
+        script_contents = parser.get_script_contents()
+        if script_contents:
+            all_js_items = []
+            for script in script_contents:
+                items_js = extract_js_keys_from_content(script)
+                all_js_items.extend(items_js)
+            if all_js_items:
+                pending = self._storage.load_pending("shared")
+                bucket = pending.setdefault(target_lang, {})
+                for item in all_js_items:
+                    text = item["text"]
+                    if text and should_translate_ui_text(text):
+                        h = self._ensure_key_mapped(text)
+                        if h not in bucket:
+                            bucket[h] = {"text": text, "prompt_type": "ui"}
+                if bucket:
+                    self._storage.save_pending("shared", pending)
+
+        # Получаем переведённый HTML и заменяем строки в скриптах
+        result_html = parser.get_html()
+        if cache:
+            from .utils import load_keys_mapping, replace_translatable_strings
+            keys_mapping = load_keys_mapping(self.cache_dir)
+            # Строим словарь оригинал -> перевод
+            original_to_translation = {}
+            for key, trans in cache.items():
+                # Если ключ — хеш (40 hex-символов), ищем оригинал в keys_mapping
+                if isinstance(key, str) and len(key) == 40 and all(c in '0123456789abcdefABCDEF' for c in key):
+                    original = keys_mapping.get(key)
+                    if original:
+                        original_to_translation[original] = trans
+                else:
+                    # Иначе считаем, что ключ уже является оригинальным текстом
+                    original_to_translation[key] = trans
+            if original_to_translation:
+                result_html = replace_translatable_strings(result_html, original_to_translation)
+        return result_html
+
+    def translate_dict(self, page_name: str, dict_name: str, source_dict: dict, target_lang: Optional[str] = None, filter_keys: Optional[List[str]] = None) -> dict:
+        if not source_dict or not isinstance(source_dict, dict):
+            return {}
+        target_lang = self._normalize_lang(target_lang)
+        if not target_lang or target_lang == self.source_lang:
+            return deep_copy_json_like(source_dict)
+
+        cache = self._load_shared_cache(target_lang)
+        pending = self._storage.load_pending("shared")
+        bucket = pending.setdefault(target_lang, {})
+        filter_set = set(filter_keys or [])
+
+        def walk(value: Any, path_parts: List[str]) -> Any:
+            if isinstance(value, dict):
+                return {k: walk(v, path_parts + [str(k)]) for k, v in value.items()}
+            if isinstance(value, list):
+                return [walk(v, path_parts + [str(i)]) for i, v in enumerate(value)]
+            if isinstance(value, str):
+                if filter_set and (not path_parts or path_parts[-1] not in filter_set):
+                    return value
+                if not should_translate_ui_text(value):
+                    return value
+                h = self._ensure_key_mapped(value)
+                if h in cache:
+                    return cache[h]
+                if h not in bucket:
+                    bucket[h] = {"text": value, "prompt_type": "ui"}
+                return value
+            return value
+
+        result = walk(deep_copy_json_like(source_dict), [])
+        if bucket:
+            self._storage.save_pending("shared", pending)
+        return result
+
+    def translate_key(self, key: str, lang: str, default: str, dict_name: str = "bot") -> str:
+        dict_name = normalize_backend_dict_name(dict_name)
+        target_lang = self._normalize_lang(lang)
+        if target_lang == self.source_lang:
+            return default
+        h = self._ensure_key_mapped(default)
+        translated = self._get_from_backend_chain(h, dict_name, target_lang)
+        if translated is not None:
+            return translated
+        pending = self._storage.load_pending(dict_name)
+        bucket = pending.setdefault(target_lang, {})
+        if h not in bucket:
+            bucket[h] = {"text": default, "prompt_type": "backend"}
+        self._storage.save_pending(dict_name, pending)
+        return default
+
+    def process_pending_translations(self, target_lang: Optional[str] = None, batch_size: int = 50) -> int:
+        return self._worker.process_pending("shared", target_lang, batch_size)
+
+    def process_backend_key_translations(self, dict_name: str = "bot", target_lang: Optional[str] = None, batch_size: int = 50) -> int:
+        dict_name = normalize_backend_dict_name(dict_name)
+        return self._worker.process_pending(dict_name, target_lang, batch_size)
+
+    def process_all_backend_key_translations(self, batch_size: int = 50) -> Dict[str, int]:
+        report = {}
+        for d in ("bot", "system"):
+            processed = self.process_backend_key_translations(d, batch_size=batch_size)
+            if processed:
+                report[d] = processed
+        return report
+
+    def process_all_translations(self, batch_size: int = 50) -> Dict[str, Dict[str, int]]:
+        report = {}
+        for page in self._page_registry.list_pages():
+            page_report = {}
+            for lang in page.target_langs:
+                html = page.html_getter(**(page.context or {}))
+                items = collect_translatable_items(html, self.cache_dir)
+                pending = self._storage.load_pending("shared")
+                bucket = pending.setdefault(lang, {})
+                for item in items:
+                    h = item["hash"]
+                    if h not in bucket:
+                        bucket[h] = {"text": item["text"], "prompt_type": "normal"}
+                self._storage.save_pending("shared", pending)
+                processed = self.process_pending_translations(target_lang=lang, batch_size=batch_size)
+                if processed:
+                    page_report[lang] = processed
+            if page_report:
+                report[page.page_name] = page_report
+        backend_report = self.process_all_backend_key_translations(batch_size)
+        if backend_report:
+            report["_backend_keys"] = backend_report
+        if self.js_globs:
+            js_report = self.extract_js_keys()
+            if js_report.get("extracted", 0):
+                report["_js_keys"] = {"extracted": js_report["extracted"], "queued": js_report["queued"]}
+        return report
+
+    def extract_js_keys(self, js_globs: Optional[List[str]] = None) -> Dict[str, int]:
+        patterns = js_globs if js_globs is not None else list(self.js_globs)
+        if not patterns:
+            return {"files": 0, "extracted": 0, "queued": 0}
+        files = resolve_glob_paths(patterns)
+        if not files:
+            return {"files": 0, "extracted": 0, "queued": 0}
+        items = extract_js_keys_from_files(files)
+        if not items:
+            return {"files": len(files), "extracted": 0, "queued": 0}
+
+        langs = self._resolve_target_langs()
+        pending = self._storage.load_pending("shared")
+        source_cache = self._load_shared_cache(self.source_lang)
+        queued = 0
+        for item in items:
+            key = item["key"]
+            text = item["text"]
+            source_cache[key] = text
+            for lang in langs:
+                if lang == self.source_lang:
+                    continue
+                lang_cache = self._load_shared_cache(lang)
+                bucket = pending.setdefault(lang, {})
+                if key in lang_cache or key in bucket:
+                    continue
+                bucket[key] = {"text": text, "prompt_type": "ui"}
+                queued += 1
+        self._storage.save_cache("shared", self.source_lang, source_cache)
+        self._storage.save_pending("shared", pending)
+        # Автоперевод отключён — pending заполняется, воркер переведёт по расписанию
+        # if queued:
+        #     self.process_pending_translations(batch_size=100)
+        return {"files": len(files), "extracted": len(items), "queued": queued}
+
+    def run_translation_loop(self, interval: int = 300, target_lang: Optional[str] = None, batch_size: int = 50, stop_event: Optional[threading.Event] = None) -> None:
+        self._worker.run_loop(interval, target_lang, batch_size, stop_event)
+
+    def get_frontend_translations(self, lang: str) -> Dict[str, str]:
+        target_lang = self._normalize_lang(lang)
+        cache = self._load_shared_cache(target_lang)
+        return cache
+
+    def build_frontend_runtime(self, lang: str, dynamic_dom_enabled: Optional[bool] = None) -> str:
+        target_lang = self._normalize_lang(lang)
+        cache = self._load_shared_cache(target_lang)  # {хеш: перевод}
+        if not cache:
+            translations = {}
+        else:
+            from .utils import load_keys_mapping
+            keys_mapping = load_keys_mapping(self.cache_dir)  # {хеш: оригинал}
+            # Строим словарь {оригинал: перевод}
+            translations = {}
+            for h, trans in cache.items():
+                original = keys_mapping.get(h)
+                if original:
+                    translations[original] = trans
+                # если оригинала нет – пропускаем
+        return build_frontend_runtime_script(
+            translations=translations,
+            fallback_lang=self.fallback_lang,
+            dynamic_dom_enabled=self.dynamic_dom_enabled if dynamic_dom_enabled is None else bool(dynamic_dom_enabled),
+        )
+
+    def get_translation_coverage(self, lang: str) -> dict:
+        lang = self._normalize_lang(lang)
+        cache = self._load_shared_cache(lang)
+        pending = self._storage.load_pending("shared").get(lang, {})
+        total = len(cache) + len(pending)
+        return {
+            "lang": lang,
+            "translated": len(cache),
+            "pending": len(pending),
+            "total": total,
+            "percent": 100.0 if total == 0 else round((len(cache) / total) * 100, 2),
+        }
+
+    def get_backend_translation_coverage(self, lang: str, dict_name: str = "bot") -> dict:
+        dict_name = normalize_backend_dict_name(dict_name)
+        lang = self._normalize_lang(lang)
+        cache = self._load_backend_cache(dict_name, lang)
+        pending = self._storage.load_pending(dict_name).get(lang, {})
+        total = len(cache) + len(pending)
+        return {
+            "dict_name": dict_name,
+            "lang": lang,
+            "translated": len(cache),
+            "pending": len(pending),
+            "total": total,
+            "percent": 100.0 if total == 0 else round((len(cache) / total) * 100, 2),
+        }
 
     def detect_browser_lang(self, accept_language: str) -> str:
         if not accept_language:
             return self.source_lang
-        return accept_language.split(",")[0].split("-")[0].strip().lower()
+        return self._normalize_lang(accept_language.split(",")[0])
 
     def get_alternative_lang(self, current_lang: str, browser_lang: str) -> str:
-        current_lang = (current_lang or "").strip().lower()
-        browser_lang = (browser_lang or "").strip().lower()
-
+        current_lang = self._normalize_lang(current_lang)
+        browser_lang = self._normalize_lang(browser_lang)
         if not browser_lang:
             return "en" if current_lang == self.source_lang else self.source_lang
-
         if current_lang == browser_lang:
             return "en" if current_lang != "en" else self.source_lang
-
         return browser_lang
