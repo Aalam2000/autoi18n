@@ -13,7 +13,7 @@ from .ai_translator import get_translator, BaseTranslator
 from .parsers.html_parser import (
     SimpleHTMLTranslator,
     collect_translatable_items,
-    resolve_prompt_type,
+    extract_html_keys_from_files,
 )
 from .parsers.js_parser import extract_js_keys_from_content, extract_js_keys_from_files
 
@@ -25,6 +25,8 @@ from .utils import (
     parse_target_langs,
     parse_bool,
     parse_json_or_csv_list,
+    parse_scan_paths,
+    DEFAULT_SCAN_PATHS,
     resolve_glob_paths,
     should_translate,
     should_translate_ui_text,
@@ -52,6 +54,7 @@ class Translator:
         target_langs: Optional[List[str]] = None,
         ai_provider: str = "openai",
         ai_config: Optional[Dict[str, Any]] = None,
+        scan_paths: Optional[List[Dict[str, str]]] = None,
     ):
         """
         Инициализация основного класса перевода.
@@ -68,7 +71,12 @@ class Translator:
         self.source_lang = normalize_lang(source_lang or os.getenv("SOURCE_LANG", "ru"))
         self.cache_dir = cache_dir
         self.target_langs = parse_target_langs(target_langs, source_lang=self.source_lang)
-        self.js_globs = parse_json_or_csv_list(os.getenv("AUTO_I18N_JS_GLOBS"))
+        # Приоритет: аргумент > env > DEFAULT_SCAN_PATHS
+        if scan_paths:
+            self.scan_paths = parse_scan_paths(scan_paths)
+        else:
+            env_paths = parse_scan_paths(os.getenv("AUTO_I18N_SCAN_PATHS"))
+            self.scan_paths = env_paths if env_paths else list(DEFAULT_SCAN_PATHS)
         self.dynamic_dom_enabled = parse_bool(os.getenv("AUTO_I18N_DYNAMIC_DOM_ENABLED"), default=False)
         self.fallback_lang = self._normalize_lang(os.getenv("AUTO_I18N_FALLBACK_LANG", self.source_lang))
 
@@ -319,22 +327,50 @@ class Translator:
         backend_report = self.process_all_backend_key_translations(batch_size)
         if backend_report:
             report["_backend_keys"] = backend_report
-        if self.js_globs:
-            js_report = self.extract_js_keys()
-            if js_report.get("extracted", 0):
-                report["_js_keys"] = {"extracted": js_report["extracted"], "queued": js_report["queued"]}
+        if self.scan_paths:
+            keys_report = self.extract_keys()
+            if keys_report.get("extracted", 0):
+                report["_keys"] = {
+                    "extracted": keys_report["extracted"],
+                    "queued": keys_report["queued"],
+                }
         return report
 
-    def extract_js_keys(self, js_globs: Optional[List[str]] = None) -> Dict[str, int]:
-        patterns = js_globs if js_globs is not None else list(self.js_globs)
-        if not patterns:
+    def extract_keys(self, scan_paths: Optional[List[Dict[str, str]]] = None) -> Dict[str, int]:
+        """
+        Единая точка входа: обходит файлы согласно scan_paths,
+        извлекает ключи (js + html), кладёт в pending для каждого целевого языка.
+        """
+        paths = parse_scan_paths(scan_paths) if scan_paths else list(self.scan_paths)
+        if not paths:
             return {"files": 0, "extracted": 0, "queued": 0}
-        files = resolve_glob_paths(patterns)
-        if not files:
-            return {"files": 0, "extracted": 0, "queued": 0}
-        items = extract_js_keys_from_files(files)
+
+        js_files: List[str] = []
+        html_files: List[str] = []
+        for item in paths:
+            matched = resolve_glob_paths([item["path"]])
+            kind = item["type"]
+            if kind == "js":
+                js_files.extend(matched)
+            elif kind == "html":
+                html_files.extend(matched)
+            else:  # auto
+                for p in matched:
+                    if p.lower().endswith((".html", ".htm")):
+                        html_files.append(p)
+                    elif p.lower().endswith((".js", ".jsx", ".tsx", ".ts")):
+                        js_files.append(p)
+
+        js_files = sorted(set(js_files))
+        html_files = sorted(set(html_files))
+
+        items: List[Dict[str, str]] = []
+        if js_files:
+            items.extend(extract_js_keys_from_files(js_files))
+        if html_files:
+            items.extend(extract_html_keys_from_files(html_files))
         if not items:
-            return {"files": len(files), "extracted": 0, "queued": 0}
+            return {"files": len(js_files) + len(html_files), "extracted": 0, "queued": 0}
 
         langs = self._resolve_target_langs()
         pending = self._storage.load_pending("shared")
@@ -353,12 +389,14 @@ class Translator:
                     continue
                 bucket[key] = {"text": text, "prompt_type": "ui"}
                 queued += 1
+
         self._storage.save_cache("shared", self.source_lang, source_cache)
         self._storage.save_pending("shared", pending)
-        # Автоперевод отключён — pending заполняется, воркер переведёт по расписанию
-        # if queued:
-        #     self.process_pending_translations(batch_size=100)
-        return {"files": len(files), "extracted": len(items), "queued": queued}
+        return {
+            "files": len(js_files) + len(html_files),
+            "extracted": len(items),
+            "queued": queued,
+        }
 
     def run_translation_loop(self, interval: int = 300, target_lang: Optional[str] = None, batch_size: int = 50, stop_event: Optional[threading.Event] = None) -> None:
         self._worker.run_loop(interval, target_lang, batch_size, stop_event)

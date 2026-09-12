@@ -44,7 +44,62 @@ t = Translator(
 # Запустить воркер (один раз или в фоновом потоке)
 t.run_translation_loop(interval=300)  # каждые 5 минут
 ```
+---
 
+## Поиск файлов для перевода (`scan_paths`)
+
+Библиотека сама решает, какие файлы сканировать. Список путей собирается из трёх источников, в порядке приоритета:
+
+1. **Аргумент `scan_paths`** в конструкторе:
+   ```python
+   t = Translator(scan_paths=[
+       {"path": "frontend/src/**/*.{js,jsx,tsx}", "type": "js"},
+       {"path": "backend/templates/**/*.html",     "type": "html"},
+       {"path": "content/**/*",                    "type": "auto"},
+   ])
+   ```
+
+2. **Env-переменная `AUTO_I18N_SCAN_PATHS`** (JSON-массив) — если аргумент не задан:
+   ```
+   AUTO_I18N_SCAN_PATHS=[{"path":"/app/frontend_src/**/*.js","type":"js"},{"path":"/app/templates/**/*.html","type":"html"}]
+   ```
+
+3. **Стандартный набор путей** (`DEFAULT_SCAN_PATHS`) — если ни аргумент, ни env не заданы:
+   ```python
+   [
+       {"path": "frontend/src/**/*.{js,jsx,tsx}",  "type": "js"},
+       {"path": "src/**/*.{js,jsx,tsx}",           "type": "js"},
+       {"path": "app/**/*.{js,jsx,tsx}",           "type": "js"},
+       {"path": "templates/**/*.html",             "type": "html"},
+       {"path": "app/templates/**/*.html",         "type": "html"},
+       {"path": "backend/templates/**/*.html",     "type": "html"},
+   ]
+   ```
+
+### Типы файлов
+
+| `type`  | Что делает |
+|---------|------------|
+| `js`    | JS/JSX/TSX: только `t('key', 'текст')`, JSX-текст, JSX-атрибуты (`label`, `placeholder`, `title`, `aria-label`). |
+| `html`  | HTML-шаблоны (Jinja/Django/FastAPI): видимый текст, атрибуты, а также `<script>` внутри — через JS-парсер. |
+| `auto`  | По расширению: `.html` → HTML, `.js/.jsx/.tsx/.ts` → JS. |
+
+### Когда что использовать
+
+- **0 конфига** — если у вас стандартный проект (React в `frontend/`, Jinja в `templates/`), ничего указывать не надо.
+- **Через `.env`** — если на dev и prod пути разные (например, внутри контейнера `/app/frontend_src` вместо `frontend/src`). Env **полностью заменяет** дефолт.
+- **Через аргумент** — если пути нестандартные (`content/`, `docs/`, внешние папки).
+
+### Метод `extract_keys()`
+
+Единая точка входа для обхода всех путей:
+
+```python
+report = t.extract_keys()
+# {'files': 28, 'extracted': 142, 'queued': 568}
+```
+
+Старый `extract_js_keys(js_globs=[...])` сохранён для обратной совместимости.
 ---
 
 ## Методы рендеринга

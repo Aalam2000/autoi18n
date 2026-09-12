@@ -50,12 +50,17 @@ def split_preserve_whitespace(text: str) -> Tuple[str, str, str]:
     return match.group(1), match.group(2), match.group(3)
 
 
+JINJA_PLACEHOLDER_RE = re.compile(r"\{\{[^}]*\}\}")
+
 def should_translate(text: str, attr_name: str = None) -> bool:
     if text is None:
         return False
     raw = text
     text = text.strip()
     if not text:
+        return False
+    # Отбрасываем строки, состоящие только из Jinja-плейсхолдеров
+    if not JINJA_PLACEHOLDER_RE.sub("", text).strip():
         return False
     if WHITESPACE_ONLY_RE.fullmatch(raw):
         return False
@@ -92,13 +97,15 @@ def should_translate_ui_text(text: str) -> bool:
     return True
 
 # Символы, которых не бывает в UI-тексте из JS-кода (признак служебной строки)
-JS_FORBIDDEN_CHARS_RE = re.compile(r"[{}<>`=$\n\r\t\\#]")
+JS_FORBIDDEN_CHARS_RE = re.compile(r"[<>`=$\n\r\t\\#]")
 # Строки, начинающиеся со служебных символов (URL, id, класс, hex-цвет)
 JS_BAD_START_RE = re.compile(r"^[/#.]")
 # Технические значения: 12px, 1.5rem, rgba(...), #fff, одиночное латинское слово
 JS_TECH_VALUE_RE = re.compile(
     r"^(?:[\d.]+(?:px|em|rem|%|vh|vw|s|ms|deg|fr)?|#[0-9A-Fa-f]{3,8}|rgba?\([^)]*\)|[A-Za-z][A-Za-z0-9_\-]*)$"
 )
+
+JS_PLACEHOLDER_RE = re.compile(r"\{\{\d+\}\}")
 
 def should_translate_js_text(text: str) -> bool:
     if text is None:
@@ -107,6 +114,10 @@ def should_translate_js_text(text: str) -> bool:
     if len(t) < 2 or len(t) > 200:
         return False
     if JS_FORBIDDEN_CHARS_RE.search(t):
+        return False
+    # Разрешаем {{N}}-плейсхолдеры, но не одиночные { } (они — код)
+    _cleaned = JS_PLACEHOLDER_RE.sub("", t)
+    if "{" in _cleaned or "}" in _cleaned:
         return False
     if JS_BAD_START_RE.match(t):
         return False
@@ -404,3 +415,47 @@ def replace_translatable_strings(html: str, translations: Dict[str, str]) -> str
 
     text_node_pattern = re.compile(r">([^<]+)<", re.DOTALL)
     return text_node_pattern.sub(text_node_replacer, html)
+
+# ---------- scan_paths: единый механизм поиска файлов для перевода ----------
+
+DEFAULT_SCAN_PATHS: List[Dict[str, str]] = [
+    {"path": "frontend/src/**/*.{js,jsx,tsx}", "type": "js"},
+    {"path": "src/**/*.{js,jsx,tsx}",          "type": "js"},
+    {"path": "app/**/*.{js,jsx,tsx}",          "type": "js"},
+    {"path": "templates/**/*.html",            "type": "html"},
+    {"path": "app/templates/**/*.html",        "type": "html"},
+    {"path": "backend/templates/**/*.html",    "type": "html"},
+]
+
+
+def parse_scan_paths(value: Any) -> List[Dict[str, str]]:
+    """
+    Принимает список словарей вида {"path": "...", "type": "js|html|auto"}
+    или JSON-строку. Возвращает валидный список.
+    """
+    if value is None:
+        return []
+    if isinstance(value, str):
+        raw = value.strip()
+        if not raw:
+            return []
+        try:
+            parsed = json.loads(raw)
+        except Exception:
+            logger.warning(f"AUTO_I18N_SCAN_PATHS is not valid JSON: {raw[:80]}")
+            return []
+        value = parsed
+    if not isinstance(value, list):
+        return []
+    result: List[Dict[str, str]] = []
+    for item in value:
+        if not isinstance(item, dict):
+            continue
+        path = str(item.get("path", "")).strip()
+        kind = str(item.get("type", "auto")).strip().lower() or "auto"
+        if not path:
+            continue
+        if kind not in {"js", "html", "auto"}:
+            kind = "auto"
+        result.append({"path": path, "type": kind})
+    return result

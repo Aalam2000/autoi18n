@@ -6,6 +6,7 @@ from .html_parser import (
     collect_translatable_items,
     resolve_prompt_type,
     ParserConfig,
+    extract_html_keys_from_files,
 )
 from .js_parser import (
     extract_js_keys_from_content,
@@ -20,5 +21,6 @@ __all__ = [
     "ParserConfig",
     "extract_js_keys_from_content",
     "extract_js_keys_from_files",
+    "extract_html_keys_from_files",
     "JSParserConfig",
 ]

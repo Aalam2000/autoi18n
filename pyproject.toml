@@ -4,7 +4,7 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "auto-i18n-lib"
-version = "1.1.9"
+version = "1.2.0"
 description = "Post-render HTML and frontend UI dictionary translation for Python projects with OpenAI-backed caching"
 authors = [
   { name = "Andrey Bondarenko", email = "bona.plus2030@gmail.com" }

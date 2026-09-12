@@ -1,4 +1,5 @@
 # src/autoi18n/parsers/html_parser.py
+import re
 import logging
 from html import escape
 from html.parser import HTMLParser
@@ -184,6 +185,49 @@ def collect_translatable_items(html: str, cache_dir: str) -> List[Dict[str, str]
     save_keys_mapping(cache_dir, mapping)
     return [{"text": result[h], "hash": h} for h in sorted(result.keys())]
 
+def extract_html_keys_from_files(file_paths: List[str]) -> List[Dict[str, str]]:
+    """
+    Извлекает переводимые ключи из HTML-файлов:
+      - видимый текст и атрибуты через SimpleHTMLTranslator;
+      - содержимое <script> через JS-парсер.
+    Возвращает список {"key": ..., "text": ...}.
+    """
+    from .js_parser import extract_js_keys_from_content
 
-# Можно добавить функцию для рендеринга с подстановкой из кэша, но она уже используется внутри Translator.
-# Для единообразия оставляем collect_translatable_items как основной сборщик.
+    result: Dict[str, str] = {}
+    for path in sorted(file_paths):
+        try:
+            with open(path, "r", encoding="utf-8") as f:
+                html = f.read()
+        except Exception as e:
+            logger.debug(f"Error reading {path}: {e}")
+            continue
+
+        # 1. HTML: текст и атрибуты (collector собирает пары hash -> text)
+        def _collector(text, tag, attr_name):
+            return text
+
+        parser = SimpleHTMLTranslator(translate_callback=_collector)
+        parser.feed(html)
+        parser.close()
+
+        # 2. <script>: JS-ключи
+        for script in parser.get_script_contents():
+            for item in extract_js_keys_from_content(script):
+                key = item["key"]
+                if key not in result:
+                    result[key] = item["text"]
+
+        # 3. Видимый HTML-текст (вне script/style): собираем через отдельный прогон
+        for tag in ("h1", "h2", "h3", "h4", "h5", "h6", "p", "button",
+                    "span", "a", "div", "label", "option", "title", "footer"):
+            pattern = re.compile(rf"<{tag}[^>]*>([^<>]+)</{tag}>", re.IGNORECASE | re.DOTALL)
+            for match in pattern.findall(html):
+                clean = match.strip()
+                if not clean or not should_translate(clean):
+                    continue
+                h = text_hash(clean)
+                if h not in result:
+                    result[h] = clean
+
+    return [{"key": k, "text": v} for k, v in result.items()]
