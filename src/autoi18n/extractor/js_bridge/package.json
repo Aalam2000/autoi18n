@@ -1,0 +1,10 @@
+{
+  "name": "autoi18n-js-bridge",
+  "version": "1.0.0",
+  "private": true,
+  "description": "Внутренний Node/Babel мост для autoi18n: AST-разбор JS/JSX/TSX вместо regex.",
+  "dependencies": {
+    "@babel/parser": "^7.24.0",
+    "@babel/traverse": "^7.24.0"
+  }
+}

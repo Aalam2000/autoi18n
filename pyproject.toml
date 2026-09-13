@@ -4,7 +4,7 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "auto-i18n-lib"
-version = "1.2.0"
+version = "2.0.1"
 description = "Post-render HTML and frontend UI dictionary translation for Python projects with OpenAI-backed caching"
 authors = [
   { name = "Andrey Bondarenko", email = "bona.plus2030@gmail.com" }
@@ -23,7 +23,8 @@ keywords = [
   "openai"
 ]
 dependencies = [
-  "openai>=1.0.0"
+  "openai>=1.0.0",
+  "python-dotenv>=1.0.0"
 ]
 
 classifiers = [
@@ -43,8 +44,17 @@ Homepage = "https://bona-plus.ru"
 Source = "https://github.com/Aalam2000/autoi18n"
 Issues = "https://github.com/Aalam2000/autoi18n/issues"
 
+[project.scripts]
+autoi18n = "autoi18n.cli:main"
+
 [tool.setuptools]
 package-dir = {"" = "src"}
+include-package-data = true
 
 [tool.setuptools.packages.find]
 where = ["src"]
+
+[tool.setuptools.package-data]
+# Node/Babel мост распространяется как ресурс пакета — Node.js обязателен
+# в окружении, где запускается сканирование (см. README, раздел "Требования").
+autoi18n = ["extractor/js_bridge/*.js", "extractor/js_bridge/*.json"]
