@@ -28,10 +28,19 @@ class SimpleHTMLTranslator(HTMLParser):
     собирает текст, возвращая его без изменений), и для применения перевода
     (callback подменяет текст на перевод)."""
 
-    def __init__(self, translate_callback: Callable[[str, Optional[str], Optional[str]], str]):
+    def __init__(
+        self,
+        translate_callback: Callable[[str, Optional[str], Optional[str]], str],
+        script_translate: Optional[Callable[[str], str]] = None,
+    ):
         super().__init__(convert_charrefs=False)
         self.result: List[str] = []
         self.translate_callback = translate_callback
+        # Применяется к содержимому КАЖДОГО <script> ПО ОТДЕЛЬНОСТИ, в момент
+        # его закрытия (см. handle_endtag) — не как один общий regex-проход
+        # по уже собранному документу целиком (см. handle_data/handle_endtag
+        # про то, почему это важно).
+        self.script_translate = script_translate
         self.tag_stack: List[str] = []
         self.skip_depth = 0
         self._script_buffer: List[str] = []
@@ -89,21 +98,42 @@ class SimpleHTMLTranslator(HTMLParser):
         self.result.append(self._render_starttag(tag, attrs, closing=" />"))
 
     def handle_endtag(self, tag):
-        self.result.append(f"</{tag}>")
-        if self.tag_stack:
-            self.tag_stack.pop()
-        if self.skip_depth > 0:
-            self.skip_depth -= 1
+        # Контент <script> закрываем и вставляем в result ЗДЕСЬ, одним
+        # куском, ДО закрывающего тега — см. handle_data про то, почему он
+        # больше не льётся в result по мере парсинга.
         if tag == "script" and self._in_script:
             self._in_script = False
             script_content = "".join(self._script_buffer)
             if script_content.strip():
                 self._script_contents.append(script_content)
+            rendered = self.script_translate(script_content) if self.script_translate else script_content
+            self.result.append(rendered)
             self._script_buffer = []
+
+        self.result.append(f"</{tag}>")
+        if self.tag_stack:
+            self.tag_stack.pop()
+        if self.skip_depth > 0:
+            self.skip_depth -= 1
 
     def handle_data(self, data):
         if self._in_script:
+            # Раньше сырой текст скрипта одновременно буферизовался И сразу
+            # лился в result по мере парсинга — а перевод содержимого script
+            # делался ПОСЛЕ, отдельным regex-проходом по уже склеенному
+            # документу целиком (replace_translatable_strings). Проблема:
+            # если перевод обычного видимого текста ДО этого script вносит
+            # непарную кавычку/апостроф (например "Время вышло!" -> "Time's
+            # up!" — новый апостроф, которого не было в оригинале), общий
+            # regex парности кавычек по всему документу сбивается, и всё,
+            # что физически идёт в файле ПОСЛЕ такого места, перестаёт
+            # находить свои кавычки правильно — script выше по файлу мог
+            # перевестись, а ниже — молча нет. Поэтому теперь: content
+            # только буферизуется тут, а переводится и вставляется в result
+            # ОДНИМ КУСКОМ в handle_endtag — независимо от остального
+            # документа, без общего прохода по кавычкам всего файла.
             self._script_buffer.append(data)
+            return
         if self.skip_depth > 0:
             self.result.append(data)
             return
@@ -219,9 +249,15 @@ def extract_html_keys_from_files(file_paths: List[str]) -> Dict[str, List[Dict[s
 def apply_translations_to_html(html: str, translations: Dict[str, str]) -> str:
     """
     Применяет перевод к готовому HTML: видимый текст и переводимые атрибуты
-    заменяются на лету при повторном проходе парсера; содержимое <script>
-    заменяется отдельно по той же карте {оригинал: перевод} (в т.ч. внутри
-    шаблонных строк с ${...} — см. utils.replace_translatable_strings).
+    заменяются на лету при проходе парсера; содержимое КАЖДОГО <script>
+    переводится ОТДЕЛЬНО, само по себе (см. utils.replace_translatable_strings
+    — в т.ч. внутри шаблонных строк с ${...}), в момент закрытия именно
+    этого тега — а не одним общим regex-проходом по всему уже склеенному
+    документу. Раньше именно общий проход был багом: перевод обычного
+    текста ДО script мог внести непарную кавычку/апостроф (например
+    "Время вышло!" -> "Time's up!"), из-за чего парность кавычек по всему
+    документу сбивалась и всё, что физически ниже в файле, переставало
+    находить свои кавычки — часть скриптов переводилась, часть молча нет.
 
     translations — плоский словарь {оригинальный_текст: перевод}, БЕЗ хешей:
     хеш используется только как ключ хранения в файлах кэша, а на этапе
@@ -231,12 +267,12 @@ def apply_translations_to_html(html: str, translations: Dict[str, str]) -> str:
         core = text.strip()
         return translations.get(core, text) if core in translations else text
 
-    parser = SimpleHTMLTranslator(translate_callback=callback)
+    def script_translate(script_content: str) -> str:
+        if not translations:
+            return script_content
+        return replace_translatable_strings(script_content, translations)
+
+    parser = SimpleHTMLTranslator(translate_callback=callback, script_translate=script_translate)
     parser.feed(html)
     parser.close()
-    result_html = parser.get_html()
-
-    if parser.get_script_contents() and translations:
-        result_html = replace_translatable_strings(result_html, translations)
-
-    return result_html
+    return parser.get_html()

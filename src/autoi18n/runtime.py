@@ -43,9 +43,19 @@ def build_frontend_runtime_script(
   var translationsUrlTemplate = {url_template};
   var currentLang = fallbackLang;
 
-  // Текст, который узел показывал ДО первой подмены — нужен, чтобы при
-  // повторном переключении языка всегда сопоставлять с оригиналом, а не
-  // с ранее подставленным переводом.
+  // Для каждого узла храним {{ original, lastApplied }}, а НЕ просто
+  // "оригинал, зафиксированный раз и навсегда". Иначе первое же значение,
+  // увиденное узлом (например, пустое имя пользователя до ответа /auth/me),
+  // навсегда застревает как "оригинал" — и когда React позже обновляет тот
+  // же текстовый узел настоящими данными, рантайм ошибочно принимает это
+  // за "перевод откатился" и затирает свежее значение обратно на старое.
+  // lastApplied — то, что мы сами последний раз туда подставили (оригинал
+  // или перевод). Если текущее значение узла совпадает с lastApplied — это
+  // наша же подстановка, отражённая обратно (просто смена языка либо
+  // повторный проход MutationObserver), и "original" переиспользуем как
+  // есть. Если не совпадает — значит, контент подменил кто-то извне (React
+  // перерисовал узел новыми данными), и именно это новое значение и есть
+  // настоящий новый "оригинал".
   var originalTextByNode = new WeakMap();
 
   // Скомпилированные маски для параметризованных фраз (строятся один раз
@@ -99,22 +109,34 @@ def build_frontend_runtime_script(
 
   function translateTextNode(node) {{
     if (shouldSkip(node)) return;
-    var original = originalTextByNode.has(node) ? originalTextByNode.get(node) : node.nodeValue;
-    var trimmed = original.trim();
-    if (!trimmed) return;
+    var current = node.nodeValue;
+    var entry = originalTextByNode.get(node);
 
-    if (!originalTextByNode.has(node)) {{
-      originalTextByNode.set(node, original);
+    var original;
+    if (!entry) {{
+      original = current; // впервые видим узел — текущее значение и есть оригинал
+    }} else if (current === entry.lastApplied) {{
+      original = entry.original; // это наша же подстановка, отражённая обратно
+    }} else {{
+      original = current; // контент подменили извне — это новый оригинал
     }}
 
-    if (currentLang === fallbackLang) {{
-      if (node.nodeValue !== original) node.nodeValue = original;
+    var trimmed = original.trim();
+    if (!trimmed) {{
+      originalTextByNode.set(node, {{ original: original, lastApplied: current }});
       return;
     }}
 
-    var translated = translateText(trimmed);
-    if (translated == null) return;
-    node.nodeValue = original.replace(trimmed, translated);
+    var nextValue;
+    if (currentLang === fallbackLang) {{
+      nextValue = original;
+    }} else {{
+      var translated = translateText(trimmed);
+      nextValue = translated == null ? original : original.replace(trimmed, translated);
+    }}
+
+    if (node.nodeValue !== nextValue) node.nodeValue = nextValue;
+    originalTextByNode.set(node, {{ original: original, lastApplied: nextValue }});
   }}
 
   var TRANSLATABLE_ATTRS = ["placeholder", "title", "alt", "aria-label"];
@@ -124,17 +146,33 @@ def build_frontend_runtime_script(
     for (var i = 0; i < TRANSLATABLE_ATTRS.length; i++) {{
       var attr = TRANSLATABLE_ATTRS[i];
       if (!el.hasAttribute(attr)) continue;
+      var current = el.getAttribute(attr);
       var stored = originalAttrByEl.get(el) || {{}};
-      var original = stored[attr] != null ? stored[attr] : el.getAttribute(attr);
-      stored[attr] = original;
-      originalAttrByEl.set(el, stored);
+      var entry = stored[attr];
 
-      if (currentLang === fallbackLang) {{
-        el.setAttribute(attr, original);
-        continue;
+      var original;
+      if (!entry) {{
+        original = current;
+      }} else if (current === entry.lastApplied) {{
+        original = entry.original;
+      }} else {{
+        original = current;
       }}
-      var translated = translateText(original.trim());
-      if (translated != null) el.setAttribute(attr, translated);
+
+      var trimmed = original.trim();
+      var nextValue;
+      if (!trimmed) {{
+        nextValue = original;
+      }} else if (currentLang === fallbackLang) {{
+        nextValue = original;
+      }} else {{
+        var translated = translateText(trimmed);
+        nextValue = translated == null ? original : translated;
+      }}
+
+      if (current !== nextValue) el.setAttribute(attr, nextValue);
+      stored[attr] = {{ original: original, lastApplied: nextValue }};
+      originalAttrByEl.set(el, stored);
     }}
   }}
 
@@ -175,28 +213,64 @@ def build_frontend_runtime_script(
   }}
 
   function setLanguage(lang) {{
-    if (lang === currentLang) return Promise.resolve();
+    console.log("🔍[i18n-trace] 3. runtime.setLanguage: запрошен lang =", lang, "| currentLang сейчас =", currentLang, "| fallbackLang =", fallbackLang);
+    if (lang === currentLang) {{
+      console.log("🔍[i18n-trace] 3a. lang === currentLang — no-op, ничего не делаем");
+      return Promise.resolve();
+    }}
 
     var apply = function () {{
+      console.log("🔍[i18n-trace] 5. apply(): применяем lang =", lang, "| размер словаря store =", Object.keys(store).length);
       currentLang = lang;
+      // window.autoI18n.currentLang — публичное поле, по которому код
+      // проекта (например, useLang() на фронтенде) узнаёт текущий язык
+      // при своей инициализации. Раньше оно выставлялось только один раз
+      // при загрузке скрипта и после первого переключения языка навсегда
+      // врало старое значение — держим его синхронным с реальным языком.
+      window.autoI18n.currentLang = lang;
       compilePatterns();
-      walk(document.body);
+      // Обход DOM не оборачивали в try/catch — одно исключение на одном
+      // узле обрывало весь walk() молча, и переключение выглядело так,
+      // будто вообще ничего не произошло (в любую сторону, включая ru).
+      try {{
+        walk(document.body);
+        console.log("🔍[i18n-trace] 6. walk(document.body) выполнен без ошибок");
+      }} catch (e) {{
+        console.error("🔍[i18n-trace] 6-ERROR. walk() upal:", e);
+      }}
       try {{ localStorage.setItem("autoI18nLang", lang); }} catch (e) {{}}
+      // Оповещаем уже смонтированные компоненты (например, независимые
+      // друг от друга вызовы useLang() в разных местах React-дерева) —
+      // без этого события они держат язык, каким он был на момент их
+      // собственного монтирования, и не узнают о переключении, сделанном
+      // из другого места страницы.
+      try {{
+        window.dispatchEvent(new CustomEvent("autoi18nlangchange", {{ detail: {{ lang: lang }} }}));
+        console.log("🔍[i18n-trace] 7. событие autoi18nlangchange отправлено");
+      }} catch (e) {{}}
     }};
 
     if (lang === fallbackLang) {{
+      console.log("🔍[i18n-trace] 3b. lang === fallbackLang — без fetch, сразу apply()");
       apply();
       return Promise.resolve();
     }}
 
     var url = translationsUrlTemplate.replace("{{lang}}", encodeURIComponent(lang));
+    console.log("🔍[i18n-trace] 3c. идём в fetch:", url);
     return fetch(url)
-      .then(function (res) {{ return res.json(); }})
+      .then(function (res) {{
+        console.log("🔍[i18n-trace] 3d. ответ от fetch получен, status =", res.status, res.ok ? "OK" : "НЕ OK");
+        return res.json();
+      }})
       .then(function (data) {{
+        console.log("🔍[i18n-trace] 3e. JSON распарсен, ключей в ответе =", data ? Object.keys(data).length : 0);
         store = data || {{}};
         apply();
       }})
-      .catch(function () {{ /* сеть недоступна — остаёмся на текущем языке */ }});
+      .catch(function (e) {{
+        console.error("🔍[i18n-trace] 3-ERROR. fetch/JSON упал:", e);
+      }});
   }}
 
   compilePatterns();
@@ -207,7 +281,21 @@ def build_frontend_runtime_script(
   window.autoI18n.fallbackLang = fallbackLang;
 
   function init() {{
-    walk(document.body);
+    // Если пользователь раньше переключал язык, он сохранён в localStorage
+    // (см. setLanguage → apply → localStorage.setItem). Раньше init() этого
+    // не проверял и всегда стартовал с fallbackLang — поэтому при простом
+    // обновлении страницы (F5) язык в переключателе (он тоже читает
+    // localStorage, но независимо, через useLang()) визуально оставался
+    // выбранным, а сам текст на странице откатывался на исходный язык.
+    var saved = null;
+    try {{
+      saved = localStorage.getItem("autoI18nLang");
+    }} catch (e) {{}}
+    if (saved && saved !== fallbackLang) {{
+      setLanguage(saved);
+    }} else {{
+      walk(document.body);
+    }}
     mountObserver();
   }}
 

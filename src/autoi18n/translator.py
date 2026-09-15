@@ -61,15 +61,34 @@ class Translator:
 
         self._storage = Storage(self.cache_dir, self.source_lang)
 
-        ai_config = dict(ai_config or {})
-        ai_config.setdefault("api_key", api_key or os.getenv("OPENAI_API_KEY"))
-        ai_config.setdefault("model", model)
-        ai_config.setdefault("source_lang", self.source_lang)
-        ai_config.setdefault("target_langs", self.config.get_target_langs())
-        self.translator: BaseTranslator = get_translator(ai_provider, ai_config)
+        # AI-клиент собираем ЛЕНИВО — только при первом реальном обращении
+        # к переводу (process_queue/add_target_lang/translate_key). Это
+        # значит, что Translator() и extract(dry_run=True) работают вообще
+        # без OPENAI_API_KEY — обязательное требование к отладочному этапу.
+        self._ai_provider = ai_provider
+        self._ai_config_base: Dict[str, Any] = dict(ai_config or {})
+        self._ai_config_base.setdefault("api_key", api_key or os.getenv("OPENAI_API_KEY"))
+        self._ai_config_base.setdefault("model", model)
+        self._ai_translator: Optional[BaseTranslator] = None
 
-        self._worker = Worker(self._storage, self.translator, self.source_lang)
+        self._worker: Optional[Worker] = None
         self._lock = threading.RLock()
+
+    @property
+    def translator(self) -> BaseTranslator:
+        """AI-клиент, созданный при первом обращении (см. комментарий в __init__)."""
+        if self._ai_translator is None:
+            ai_config = dict(self._ai_config_base)
+            ai_config.setdefault("source_lang", self.source_lang)
+            ai_config.setdefault("target_langs", self.config.get_target_langs())
+            self._ai_translator = get_translator(self._ai_provider, ai_config)
+        return self._ai_translator
+
+    @property
+    def _worker_instance(self) -> Worker:
+        if self._worker is None:
+            self._worker = Worker(self._storage, self.translator, self.source_lang)
+        return self._worker
 
     def _normalize(self, lang: str) -> str:
         return normalize_lang(lang, source_lang=self.source_lang)
@@ -189,6 +208,18 @@ class Translator:
         source_cache = self._storage.load_cache("shared", self.source_lang)
         return {source_cache[h]: trans for h, trans in cache.items() if h in source_cache}
 
+    def get_translations_dict(self, lang: str) -> Dict[str, str]:
+        """
+        Публичная обёртка над _translations_map: плоский словарь
+        {оригинальный_текст: перевод} для данного языка. Именно этот формат
+        должен отдавать backend-эндпоинт, который вызывает клиентский
+        рантайм (window.autoI18n.setLanguage) при смене языка.
+        """
+        lang = self._normalize(lang)
+        if lang == self.source_lang:
+            return {}
+        return self._translations_map(lang)
+
     def apply_to_html(self, html: str, lang: str) -> str:
         lang = self._normalize(lang)
         if lang == self.source_lang:
@@ -221,12 +252,27 @@ class Translator:
 
         return walk(deep_copy_json_like(source_dict), [])
 
-    def build_runtime(self, lang: str, dynamic_dom_enabled: bool = False) -> str:
+    def build_runtime(
+        self,
+        lang: str,
+        dynamic_dom_enabled: bool = False,
+        translations_url_template: Optional[str] = None,
+    ) -> str:
+        """
+        translations_url_template — по умолчанию относительный путь
+        ("/i18n/translations?lang={lang}"), рассчитанный на то, что backend
+        и frontend отдаются с одного origin. Если они на разных origin
+        (например, React dev-server на :3000 и API на :8000) — рантайм
+        выполняется в контексте страницы (тот origin, где стоит <script>,
+        а не тот, откуда он загружен), и относительный fetch уйдёт не туда.
+        В этом случае нужно передать сюда абсолютный URL backend'а.
+        """
         lang = self._normalize(lang)
         return build_frontend_runtime_script(
             translations=self._translations_map(lang),
             fallback_lang=self.source_lang,
             dynamic_dom_enabled=dynamic_dom_enabled,
+            translations_url_template=translations_url_template,
         )
 
     # ---------- backend-словари: явно зарегистрированные бэкенд-фразы
@@ -283,7 +329,7 @@ class Translator:
     def process_queue(self, batch_size: int = 50) -> int:
         total = 0
         for dict_type in ("shared", "bot", "system"):
-            total += self._worker.process_pending(dict_type, None, batch_size)
+            total += self._worker_instance.process_pending(dict_type, None, batch_size)
         return total
 
     def run_translation_loop(self, interval: int = 300, batch_size: int = 50, stop_event=None) -> None:
