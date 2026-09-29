@@ -6,7 +6,7 @@
 t()/translateKey()). Вместо этого он после рендера проходит по уже
 отрисованному DOM и подменяет видимый текст на перевод — так же для
 JSX-контента, обычного HTML и текста, который код меняет императивно
-(например, textContent счётчика в квизе). Динамические изменения DOM
+(например, textContent счётчика или таймера). Динамические изменения DOM
 (перерисовка React, обновление счётчика/таймера) подхватываются через
 MutationObserver — если он включён.
 
@@ -22,7 +22,7 @@ fetch(translationsUrl) — эндпоинт должен отдавать пло
 {"оригинальный текст": "перевод", ...} (см. Translator._translations_map).
 """
 import json
-from typing import Dict, Optional
+from typing import Dict, List, Optional
 
 
 def build_frontend_runtime_script(
@@ -30,8 +30,13 @@ def build_frontend_runtime_script(
     fallback_lang: str = "ru",
     dynamic_dom_enabled: bool = True,
     translations_url_template: Optional[str] = None,
+    extra_attrs: Optional[List[str]] = None,
 ) -> str:
     payload = json.dumps(translations or {}, ensure_ascii=False)
+    # стандартные атрибуты + дополнительные из данных проекта (autoi18n.json "attributes")
+    attrs = ["placeholder", "title", "alt", "aria-label", "label"]
+    attrs += [a for a in (extra_attrs or []) if a not in attrs]
+    attrs_json = json.dumps(attrs)
     observer_enabled = "true" if dynamic_dom_enabled else "false"
     url_template = json.dumps(translations_url_template or "/i18n/translations?lang={lang}")
 
@@ -139,7 +144,7 @@ def build_frontend_runtime_script(
     originalTextByNode.set(node, {{ original: original, lastApplied: nextValue }});
   }}
 
-  var TRANSLATABLE_ATTRS = ["placeholder", "title", "alt", "aria-label"];
+  var TRANSLATABLE_ATTRS = {attrs_json};
   var originalAttrByEl = new WeakMap();
 
   function translateAttrs(el) {{
@@ -200,6 +205,9 @@ def build_frontend_runtime_script(
         var m = mutations[i];
         if (m.type === "characterData" && m.target) {{
           translateTextNode(m.target);
+        }} else if (m.type === "attributes" && m.target) {{
+          // React поменял значение подсказки/placeholder и т.п. — переводим заново
+          translateAttrs(m.target);
         }} else {{
           walk(m.target);
         }}
@@ -209,18 +217,17 @@ def build_frontend_runtime_script(
       childList: true,
       subtree: true,
       characterData: true,
+      attributes: true,
+      attributeFilter: TRANSLATABLE_ATTRS,
     }});
   }}
 
   function setLanguage(lang) {{
-    console.log("🔍[i18n-trace] 3. runtime.setLanguage: запрошен lang =", lang, "| currentLang сейчас =", currentLang, "| fallbackLang =", fallbackLang);
     if (lang === currentLang) {{
-      console.log("🔍[i18n-trace] 3a. lang === currentLang — no-op, ничего не делаем");
       return Promise.resolve();
     }}
 
     var apply = function () {{
-      console.log("🔍[i18n-trace] 5. apply(): применяем lang =", lang, "| размер словаря store =", Object.keys(store).length);
       currentLang = lang;
       // window.autoI18n.currentLang — публичное поле, по которому код
       // проекта (например, useLang() на фронтенде) узнаёт текущий язык
@@ -234,9 +241,8 @@ def build_frontend_runtime_script(
       // будто вообще ничего не произошло (в любую сторону, включая ru).
       try {{
         walk(document.body);
-        console.log("🔍[i18n-trace] 6. walk(document.body) выполнен без ошибок");
       }} catch (e) {{
-        console.error("🔍[i18n-trace] 6-ERROR. walk() upal:", e);
+        console.error("autoi18n: ошибка при обходе DOM", e);
       }}
       try {{ localStorage.setItem("autoI18nLang", lang); }} catch (e) {{}}
       // Оповещаем уже смонтированные компоненты (например, независимые
@@ -246,30 +252,25 @@ def build_frontend_runtime_script(
       // из другого места страницы.
       try {{
         window.dispatchEvent(new CustomEvent("autoi18nlangchange", {{ detail: {{ lang: lang }} }}));
-        console.log("🔍[i18n-trace] 7. событие autoi18nlangchange отправлено");
       }} catch (e) {{}}
     }};
 
     if (lang === fallbackLang) {{
-      console.log("🔍[i18n-trace] 3b. lang === fallbackLang — без fetch, сразу apply()");
       apply();
       return Promise.resolve();
     }}
 
     var url = translationsUrlTemplate.replace("{{lang}}", encodeURIComponent(lang));
-    console.log("🔍[i18n-trace] 3c. идём в fetch:", url);
     return fetch(url)
       .then(function (res) {{
-        console.log("🔍[i18n-trace] 3d. ответ от fetch получен, status =", res.status, res.ok ? "OK" : "НЕ OK");
         return res.json();
       }})
       .then(function (data) {{
-        console.log("🔍[i18n-trace] 3e. JSON распарсен, ключей в ответе =", data ? Object.keys(data).length : 0);
         store = data || {{}};
         apply();
       }})
       .catch(function (e) {{
-        console.error("🔍[i18n-trace] 3-ERROR. fetch/JSON упал:", e);
+        console.error("autoi18n: не удалось загрузить словарь", e);
       }});
   }}
 

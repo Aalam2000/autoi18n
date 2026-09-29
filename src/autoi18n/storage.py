@@ -89,9 +89,14 @@ class Storage:
         self._invalidate(path)
 
     # ---------- очереди ----------
-    def load_pending(self, dict_type: str) -> Dict[str, Dict[str, Dict[str, str]]]:
+    def load_pending(self, dict_type: str) -> Dict[str, Dict[str, Dict]]:
+        """
+        {lang: {storage_key: {"text", "prompt_type", ["attempts", "problems"]}}}.
+        attempts/problems появляются у фраз, перевод которых не прошёл
+        проверку качества (см. worker.py) — по ним же строится отчёт audit.
+        """
         data = self._cached_load(self._pending_path(dict_type))
-        result: Dict[str, Dict[str, Dict[str, str]]] = {}
+        result: Dict[str, Dict[str, Dict]] = {}
         for lang, items in data.items():
             if not isinstance(lang, str) or not isinstance(items, dict):
                 continue
@@ -100,16 +105,28 @@ class Storage:
             for storage_key, meta in items.items():
                 if not isinstance(storage_key, str):
                     continue
+                entry: Dict = {"text": storage_key, "prompt_type": "normal"}
                 if isinstance(meta, dict):
-                    text = str(meta.get("text", storage_key))
-                    prompt_type = str(meta.get("prompt_type", "normal"))
-                else:
-                    text = storage_key
-                    prompt_type = "normal"
-                bucket[storage_key] = {"text": text, "prompt_type": prompt_type}
+                    entry["text"] = str(meta.get("text", storage_key))
+                    entry["prompt_type"] = str(meta.get("prompt_type", "normal"))
+                    try:
+                        attempts = int(meta.get("attempts", 0) or 0)
+                    except (TypeError, ValueError):
+                        attempts = 0
+                    if attempts:
+                        entry["attempts"] = attempts
+                    if isinstance(meta.get("problems"), list):
+                        entry["problems"] = [str(p) for p in meta["problems"]]
+                    # диагностика последней неудачной попытки (см. worker.py, report.py)
+                    for extra in ("version", "last_response", "api_error"):
+                        if meta.get(extra) is not None:
+                            entry[extra] = str(meta[extra])
+                    if meta.get("recheck"):
+                        entry["recheck"] = True
+                bucket[storage_key] = entry
         return result
 
-    def save_pending(self, dict_type: str, data: Dict[str, Dict[str, Dict[str, str]]]) -> None:
+    def save_pending(self, dict_type: str, data: Dict[str, Dict[str, Dict]]) -> None:
         cleaned = {}
         for lang, items in data.items():
             if not items:

@@ -14,7 +14,13 @@ from html.parser import HTMLParser
 from typing import Callable, Dict, List, Optional, Tuple
 
 from ..utils import should_translate, split_preserve_whitespace, replace_translatable_strings
+from . import js_extractor
 from .js_extractor import extract_js_items_from_files
+
+# Ошибки разбора <script> внутри HTML последнего extract_html_keys_from_files —
+# уже с именем HTML-файла, а не временного .js (для отчёта, см. report.py):
+# {"шаблон.html (<script> №2)": "текст ошибки"}
+LAST_SCRIPT_PROBLEMS: Dict[str, str] = {}
 
 
 class ParserConfig:
@@ -32,8 +38,11 @@ class SimpleHTMLTranslator(HTMLParser):
         self,
         translate_callback: Callable[[str, Optional[str], Optional[str]], str],
         script_translate: Optional[Callable[[str], str]] = None,
+        extra_attrs: Optional[List[str]] = None,
     ):
         super().__init__(convert_charrefs=False)
+        # стандартные + дополнительные атрибуты из данных проекта
+        self.attrs = set(ParserConfig.TRANSLATABLE_ATTRS) | {a.lower() for a in (extra_attrs or [])}
         self.result: List[str] = []
         self.translate_callback = translate_callback
         # Применяется к содержимому КАЖДОГО <script> ПО ОТДЕЛЬНОСТИ, в момент
@@ -73,7 +82,7 @@ class SimpleHTMLTranslator(HTMLParser):
                 continue
             new_value = value
             if self.skip_depth == 0:
-                if name in ParserConfig.TRANSLATABLE_ATTRS and should_translate(value, attr_name=name):
+                if name in self.attrs and should_translate(value, attr_name=name):
                     new_value = self.translate_callback(value, tag, name)
                 elif (tag == "input" and name == "value"
                       and input_type in ParserConfig.BUTTON_VALUE_TYPES
@@ -172,7 +181,56 @@ class SimpleHTMLTranslator(HTMLParser):
         return self._script_contents
 
 
-def _extract_script_items(script_contents: List[str]) -> List[Dict[str, object]]:
+def neutralize_template_tags(code: str) -> str:
+    """
+    Убирает вставки серверных шаблонов (Jinja2/Django/Twig: {{ … }},
+    {% … %}, {# … #}) из JS-кода <script> перед разбором — иначе, например,
+    `const QUESTIONS = {{ questions_json }};` не является JavaScript и
+    Babel не разбирает весь скрипт (фразы из него терялись).
+
+    Вставка ВНЕ строковых литералов заменяется на `null` ({{ … }}) или на
+    пробелы ({% … %}, {# … #}); внутри строк ('…', "…", `…`) текст не
+    трогается — это часть видимой фразы. Переводы строк сохраняются, чтобы
+    номера строк в отчёте совпадали с исходником.
+    """
+    out = []
+    i, n = 0, len(code)
+    quote = None
+    while i < n:
+        ch = code[i]
+        if quote:
+            out.append(ch)
+            if ch == "\\" and i + 1 < n:
+                out.append(code[i + 1])
+                i += 2
+                continue
+            if ch == quote:
+                quote = None
+            i += 1
+            continue
+        if ch in ("'", '"', "`"):
+            quote = ch
+            out.append(ch)
+            i += 1
+            continue
+        if ch == "{" and i + 1 < n and code[i + 1] in "{%#":
+            closer = {"{": "}}", "%": "%}", "#": "#}"}[code[i + 1]]
+            end = code.find(closer, i + 2)
+            if end != -1:
+                chunk = code[i:end + 2]
+                blank = "".join("\n" if c == "\n" else " " for c in chunk)
+                if code[i + 1] == "{":
+                    blank = "null" + blank[4:] if len(blank) >= 4 else "null"
+                out.append(blank)
+                i = end + 2
+                continue
+        out.append(ch)
+        i += 1
+    return "".join(out)
+
+
+def _extract_script_items(script_contents: List[str], source_name: Optional[str] = None,
+                          extra_attrs: Optional[List[str]] = None) -> List[Dict[str, object]]:
     """
     Прогоняет содержимое каждого <script> через Node/Babel мост.
     Node принимает файлы, а не сырой текст, поэтому каждый скрипт временно
@@ -187,10 +245,16 @@ def _extract_script_items(script_contents: List[str]) -> List[Dict[str, object]]
         for content in script_contents:
             fd, path = tempfile.mkstemp(suffix=".js", prefix=".autoi18n_script_")
             with os.fdopen(fd, "w", encoding="utf-8") as f:
-                f.write(content)
+                f.write(neutralize_template_tags(content))
             tmp_files.append(path)
 
-        results = extract_js_items_from_files(tmp_files)
+        results = extract_js_items_from_files(tmp_files, extra_attrs)
+        files_errors = js_extractor.LAST_PROBLEMS.get("files") or {}
+        for idx, path in enumerate(tmp_files, 1):
+            if path in files_errors:
+                LAST_SCRIPT_PROBLEMS[f"{source_name or 'HTML'} (<script> №{idx})"] = str(files_errors[path])
+        if js_extractor.LAST_PROBLEMS.get("bridge"):
+            LAST_SCRIPT_PROBLEMS[f"{source_name or 'HTML'} (<script>)"] = str(js_extractor.LAST_PROBLEMS["bridge"])
         items: List[Dict[str, object]] = []
         for path in tmp_files:
             items.extend(results.get(path, []))
@@ -203,7 +267,8 @@ def _extract_script_items(script_contents: List[str]) -> List[Dict[str, object]]
                 pass
 
 
-def collect_translatable_items(html: str) -> List[Dict[str, object]]:
+def collect_translatable_items(html: str, source_name: Optional[str] = None,
+                               extra_attrs: Optional[List[str]] = None) -> List[Dict[str, object]]:
     """
     Извлекает все переводимые фразы из одного HTML-документа: видимый текст,
     переводимые атрибуты и содержимое <script> (через AST). Возвращает
@@ -220,11 +285,11 @@ def collect_translatable_items(html: str) -> List[Dict[str, object]]:
             items.append({"text": core, "placeholders": 0, "line": None})
         return text
 
-    parser = SimpleHTMLTranslator(translate_callback=collector)
+    parser = SimpleHTMLTranslator(translate_callback=collector, extra_attrs=extra_attrs)
     parser.feed(html)
     parser.close()
 
-    for item in _extract_script_items(parser.get_script_contents()):
+    for item in _extract_script_items(parser.get_script_contents(), source_name, extra_attrs):
         text = item["text"]
         if text not in seen:
             seen.add(text)
@@ -233,20 +298,24 @@ def collect_translatable_items(html: str) -> List[Dict[str, object]]:
     return items
 
 
-def extract_html_keys_from_files(file_paths: List[str]) -> Dict[str, List[Dict[str, object]]]:
+def extract_html_keys_from_files(file_paths: List[str],
+                                 extra_attrs: Optional[List[str]] = None) -> Dict[str, List[Dict[str, object]]]:
     """Аналог extract_js_items_from_files, но для HTML-файлов."""
     result: Dict[str, List[Dict[str, object]]] = {}
+    LAST_SCRIPT_PROBLEMS.clear()
     for path in sorted(file_paths):
         try:
             with open(path, "r", encoding="utf-8") as f:
                 html = f.read()
-        except Exception:
+        except Exception as e:  # noqa: BLE001
+            LAST_SCRIPT_PROBLEMS[path] = f"не удалось прочитать файл: {e}"
             continue
-        result[path] = collect_translatable_items(html)
+        result[path] = collect_translatable_items(html, path, extra_attrs)
     return result
 
 
-def apply_translations_to_html(html: str, translations: Dict[str, str]) -> str:
+def apply_translations_to_html(html: str, translations: Dict[str, str],
+                               extra_attrs: Optional[List[str]] = None) -> str:
     """
     Применяет перевод к готовому HTML: видимый текст и переводимые атрибуты
     заменяются на лету при проходе парсера; содержимое КАЖДОГО <script>
@@ -272,7 +341,8 @@ def apply_translations_to_html(html: str, translations: Dict[str, str]) -> str:
             return script_content
         return replace_translatable_strings(script_content, translations)
 
-    parser = SimpleHTMLTranslator(translate_callback=callback, script_translate=script_translate)
+    parser = SimpleHTMLTranslator(translate_callback=callback, script_translate=script_translate,
+                                  extra_attrs=extra_attrs)
     parser.feed(html)
     parser.close()
     return parser.get_html()

@@ -5,16 +5,12 @@ import re
 import tempfile
 import hashlib
 import logging
-from glob import glob
 from typing import Any, Dict, List, Optional, Tuple
 
 WHITESPACE_ONLY_RE = re.compile(r"^\s*$")
 NUMBER_LIKE_RE = re.compile(r"^[\d\s\.,:/\-]+$")
 HEX_LIKE_RE = re.compile(r"^[A-Fa-f0-9\-]{8,}$")
 PURE_LATIN_TECH_RE = re.compile(r"^[A-Za-z0-9_\-\s\.:/@#%+=]+$")
-
-# Константы для хранения маппинга "текст -> хеш"
-KEYS_MAPPING_FILENAME = "_keys.json"
 
 # ---------- Логирование (отключаемое) ----------
 logger = logging.getLogger(__name__)
@@ -25,23 +21,6 @@ def text_hash(text: str) -> str:
     """Возвращает SHA1 хеш текста (используется как ключ в кэше)."""
     return hashlib.sha1(text.encode("utf-8")).hexdigest()
 
-
-def load_keys_mapping(cache_dir: str) -> Dict[str, str]:
-    """Загружает маппинг {text: hash} из cache_dir/_keys.json."""
-    path = os.path.join(cache_dir, KEYS_MAPPING_FILENAME)
-    data = safe_json_load(path)
-    if isinstance(data, dict):
-        return data
-    return {}
-
-
-def save_keys_mapping(cache_dir: str, mapping: Dict[str, str]) -> None:
-    """Сохраняет маппинг {text: hash} в cache_dir/_keys.json."""
-    path = os.path.join(cache_dir, KEYS_MAPPING_FILENAME)
-    safe_json_save(path, mapping)
-
-
-# ---------- остальные утилиты (без изменений) ----------
 
 def split_preserve_whitespace(text: str) -> Tuple[str, str, str]:
     match = re.match(r"^(\s*)(.*?)(\s*)$", text, flags=re.DOTALL)
@@ -166,62 +145,6 @@ def parse_target_langs(value: Any, source_lang: str = "ru") -> List[str]:
         if lang not in result and lang != source_lang:
             result.append(lang)
     return result
-
-
-def parse_bool(value: Any, default: bool = False) -> bool:
-    if value is None:
-        return default
-    if isinstance(value, bool):
-        return value
-    normalized = str(value).strip().lower()
-    if normalized in {"1", "true", "yes", "on"}:
-        return True
-    if normalized in {"0", "false", "no", "off"}:
-        return False
-    return default
-
-
-def parse_json_or_csv_list(value: Any) -> List[str]:
-    if value is None:
-        return []
-    if isinstance(value, (list, tuple, set)):
-        return [str(item).strip() for item in value if str(item).strip()]
-    raw = str(value).strip()
-    if not raw:
-        return []
-    if raw.startswith("["):
-        try:
-            parsed = json.loads(raw)
-            if isinstance(parsed, list):
-                return [str(item).strip() for item in parsed if str(item).strip()]
-        except Exception:
-            pass
-    return [item.strip() for item in raw.split(",") if item.strip()]
-
-
-def resolve_glob_paths(patterns: List[str]) -> List[str]:
-    results = []
-    seen = set()
-    for pattern in patterns:
-        for path in sorted(glob(pattern, recursive=True)):
-            if path not in seen and os.path.isfile(path):
-                seen.add(path)
-                results.append(path)
-    return results
-
-
-def build_lang_chain(target_lang: str, source_lang: str) -> List[str]:
-    target_lang = normalize_lang(target_lang, source_lang=source_lang)
-    source_lang = normalize_lang(source_lang, source_lang=source_lang)
-    chain: List[str] = []
-    def add(item: str) -> None:
-        if item and item not in chain:
-            chain.append(item)
-    add(target_lang)
-    if "-" in target_lang:
-        add(target_lang.split("-")[0])
-    add(source_lang)
-    return chain
 
 
 def safe_json_load(path: str) -> Dict[str, Any]:
@@ -415,47 +338,3 @@ def replace_translatable_strings(html: str, translations: Dict[str, str]) -> str
 
     text_node_pattern = re.compile(r">([^<]+)<", re.DOTALL)
     return text_node_pattern.sub(text_node_replacer, html)
-
-# ---------- scan_paths: единый механизм поиска файлов для перевода ----------
-
-DEFAULT_SCAN_PATHS: List[Dict[str, str]] = [
-    {"path": "frontend/src/**/*.{js,jsx,tsx}", "type": "js"},
-    {"path": "src/**/*.{js,jsx,tsx}",          "type": "js"},
-    {"path": "app/**/*.{js,jsx,tsx}",          "type": "js"},
-    {"path": "templates/**/*.html",            "type": "html"},
-    {"path": "app/templates/**/*.html",        "type": "html"},
-    {"path": "backend/templates/**/*.html",    "type": "html"},
-]
-
-
-def parse_scan_paths(value: Any) -> List[Dict[str, str]]:
-    """
-    Принимает список словарей вида {"path": "...", "type": "js|html|auto"}
-    или JSON-строку. Возвращает валидный список.
-    """
-    if value is None:
-        return []
-    if isinstance(value, str):
-        raw = value.strip()
-        if not raw:
-            return []
-        try:
-            parsed = json.loads(raw)
-        except Exception:
-            logger.warning(f"AUTO_I18N_SCAN_PATHS is not valid JSON: {raw[:80]}")
-            return []
-        value = parsed
-    if not isinstance(value, list):
-        return []
-    result: List[Dict[str, str]] = []
-    for item in value:
-        if not isinstance(item, dict):
-            continue
-        path = str(item.get("path", "")).strip()
-        kind = str(item.get("type", "auto")).strip().lower() or "auto"
-        if not path:
-            continue
-        if kind not in {"js", "html", "auto"}:
-            kind = "auto"
-        result.append({"path": path, "type": kind})
-    return result
