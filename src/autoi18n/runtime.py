@@ -10,6 +10,9 @@ JSX-контента, обычного HTML и текста, который ко
 (перерисовка React, обновление счётчика/таймера) подхватываются через
 MutationObserver — если он включён.
 
+Нативные диалоги alert()/confirm() в DOM не попадают — их сообщение
+переводится в момент вызова (обёртка над window.alert / window.confirm).
+
 Параметризованные фразы ("Вопрос {{0}} / {{1}}") сопоставляются с живым
 текстом на странице по маске (регулярка из шаблона с capture-группами на
 месте {{n}}) — без вызова в коде это единственный способ понять, что
@@ -273,6 +276,31 @@ def build_frontend_runtime_script(
         console.error("autoi18n: не удалось загрузить словарь", e);
       }});
   }}
+
+  // Нативные диалоги alert()/confirm() — не DOM, обход и MutationObserver их
+  // не видят: переводим сообщение в момент вызова тем же словарём и масками.
+  function translateMessage(message) {{
+    if (currentLang === fallbackLang || typeof message !== "string") return message;
+    var trimmed = message.trim();
+    if (!trimmed) return message;
+    var translated = translateText(trimmed);
+    return translated == null ? message : message.replace(trimmed, function () {{ return translated; }});
+  }}
+
+  function wrapDialog(name) {{
+    var native = window[name];
+    if (typeof native !== "function" || native.autoI18nWrapped) return;
+    var wrapped = function () {{
+      var args = Array.prototype.slice.call(arguments);
+      if (args.length) args[0] = translateMessage(args[0]);
+      return native.apply(window, args);
+    }};
+    wrapped.autoI18nWrapped = true;
+    window[name] = wrapped;
+  }}
+
+  wrapDialog("alert");
+  wrapDialog("confirm");
 
   compilePatterns();
 
